@@ -23,8 +23,8 @@ parent/
 ## Quick start
 
 ```sh
-python3 build.py                              # clone crust + coost, build everything, test, run the examples
-python3 build.py run examples/example1/src    # compile and run a program
+python3 build.py                        # clone crust + coost, build everything, test, run the examples
+python3 build.py run path/to/your/cs    # compile and run a C# program
 ```
 
 You need `python3`, `git` (only to clone the two dependencies), a C compiler (`cc` or `gcc`), and the **.NET SDK 8 or
@@ -45,7 +45,6 @@ everything works offline once the two dependencies are present. It has only been
 | `coost` | build coost with its own `build.py` (`--test` also runs coost's tests) |
 | `corelib` | check the corelib: the C# compiles, the native helpers lower through cpprust and compile |
 | `test [names..]` | the input tests, then every case in `crust/tests` compared with real .NET |
-| `examples` | build and run everything in `examples/` |
 | `convert INPUT.. [-o DIR] [--c]` | write the generated C++ (and with `--c` one self-contained C file) |
 | `compile INPUT.. [-o EXE]` | build a native executable. Default: `build/bin/NAME` |
 | `run INPUT.. [-- ARGS..]` | compile and run; everything after `--` goes to the program. Exits with the program's status. |
@@ -58,7 +57,7 @@ everything works offline once the two dependencies are present. It has only been
 can convert an entire C# project (or several) in a single command:
 
 ```sh
-python3 build.py run     examples/example1/src                  # a folder
+python3 build.py run     path/to/cs                             # a folder
 python3 build.py run     Hello.cs                               # one file
 python3 build.py compile src/ extra/Helpers.cs tools/Util.cs    # folders and files together
 python3 build.py compile 'src/**/*.cs'                          # a wildcard (when your shell leaves it alone)
