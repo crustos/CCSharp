@@ -75,9 +75,9 @@ namespace System {
     public extern string Message { get; }
   }
   public class SystemException : Exception { public SystemException() {} public SystemException(string message) {} }
-  public class ArgumentException : SystemException { public ArgumentException() {} public ArgumentException(string message) {} }
-  public class ArgumentNullException : ArgumentException { public ArgumentNullException() {} public ArgumentNullException(string message) {} }
-  public class ArgumentOutOfRangeException : ArgumentException { public ArgumentOutOfRangeException() {} public ArgumentOutOfRangeException(string message) {} }
+  public class ArgumentException : SystemException { public ArgumentException() {} public ArgumentException(string message) {} public ArgumentException(string message, string paramName) {} }
+  public class ArgumentNullException : ArgumentException { public ArgumentNullException() {} public ArgumentNullException(string message) {} public ArgumentNullException(string paramName, string message) {} }
+  public class ArgumentOutOfRangeException : ArgumentException { public ArgumentOutOfRangeException() {} public ArgumentOutOfRangeException(string message) {} public ArgumentOutOfRangeException(string paramName, string message) {} }
   public class InvalidOperationException : SystemException { public InvalidOperationException() {} public InvalidOperationException(string message) {} }
   public class NotImplementedException : SystemException { public NotImplementedException() {} public NotImplementedException(string message) {} }
   public class NotSupportedException : SystemException { public NotSupportedException() {} public NotSupportedException(string message) {} }

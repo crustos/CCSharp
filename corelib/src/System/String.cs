@@ -40,7 +40,12 @@ namespace System {
     public extern string Remove(int startIndex);
     public extern char[] ToCharArray();
     public static extern string Join(string separator, string[] values);
+    // Declared for BINDING only: Roslyn lowers `$"{a} {b} {c}"` to the Format overload of matching arity, and fails to compile if
+    // it is missing. The emitter writes interpolated strings itself and never calls these, and a direct call is refused by name.
     public static extern string Format(string format, object arg0);
+    public static extern string Format(string format, object arg0, object arg1);
+    public static extern string Format(string format, object arg0, object arg1, object arg2);
+    public static extern string Format(string format, params object[] args);
     public static extern string Concat(string a, string b);
     public static extern bool IsNullOrWhiteSpace(string value);
   }
