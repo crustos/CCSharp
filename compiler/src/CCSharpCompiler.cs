@@ -13,6 +13,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Text;
+using System.Linq;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -51,6 +52,7 @@ namespace CCSharpCompiler;
     public static bool debug = false;
     public static bool no_npe_checks = false;
     public static bool no_abe_checks = false;
+    public static bool crust = false;
     public static List<string> refs = new List<string>();
     public static List<string> libs = new List<string>();
 
@@ -86,6 +88,8 @@ namespace CCSharpCompiler;
         Console.WriteLine("    disable ABE checks");
         Console.WriteLine("  --console");
         Console.WriteLine("    create console app");
+        Console.WriteLine("  --crust");
+        Console.WriteLine("    emit the C++ subset accepted by Crust (cpprust) instead of GC C++");
         return;
       }
 
@@ -129,6 +133,9 @@ namespace CCSharpCompiler;
         }
         if (arg == "--console") {
           console = true;
+        }
+        if (arg == "--crust") {
+          crust = true;
         }
         if (arg == "--no-npe-checks") {
           no_npe_checks = true;
@@ -193,7 +200,7 @@ namespace CCSharpCompiler;
         Console.WriteLine("Error:--service requires --main");
         return;
       }
-      if (!library && main == null) {
+      if (!library && main == null && !crust) {
         Console.WriteLine("Error:application requires --main");
         return;
       }
@@ -213,6 +220,10 @@ namespace CCSharpCompiler;
         ext_lib = ".a";
         ext_exe = "";
         path_sep = "/";
+      }
+      if (crust) {
+        new Program().ProcessCrust();
+        return;
       }
       if (windows) {
         BuildNinjaWindows();
@@ -274,6 +285,107 @@ namespace CCSharpCompiler;
         new Generate().GenerateSources();
       } catch (Exception e) {
         Console.WriteLine(e.ToString());
+      }
+    }
+
+    /** --crust : Roslyn analyses the C#, CrustEmitter writes the Crust C++ subset. */
+    void ProcessCrust()
+    {
+      compiler = CSharpCompilation.Create("C#");
+      compiler = compiler.WithOptions(compiler.Options.WithOutputKind(OutputKind.ConsoleApplication).WithAllowUnsafe(true));
+      //type information comes from the .NET reference assemblies; the CC# corelib is not used
+      var tpa = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") ?? "").Split(Path.PathSeparator);
+      foreach (var a in tpa) {
+        string n = Path.GetFileName(a);
+        if (n == "System.Private.CoreLib.dll" || n == "System.Runtime.dll" || n == "System.Console.dll"
+            || n == "System.Collections.dll" || n == "System.Linq.dll" || n == "netstandard.dll" || n == "mscorlib.dll") {
+          compiler = compiler.AddReferences(MetadataReference.CreateFromFile(a));
+        }
+      }
+      path_sep = "/";
+      ext_obj = ".o";
+      AddFolderSorted(csFolder);
+      bool failed = false;
+      foreach (var diag in compiler.GetDiagnostics()) {
+        if (diag.Severity != DiagnosticSeverity.Error) continue;
+        if (diag.Id == "CS0626") continue;
+        if (diag.Location.SourceTree != null) Console.Write(FindTree(diag.Location.SourceTree) + ": ");
+        Console.WriteLine(diag.ToString());
+        failed = true;
+      }
+      if (failed) {
+        Console.WriteLine("Compiler Errors Detected!");
+        Environment.Exit(1);
+      }
+      foreach (Source node in files) node.model = compiler.GetSemanticModel(node.tree);
+      files = CrustOrder(files);
+      Directory.CreateDirectory(cppFolder);
+      var em = new CrustEmitter(main);
+      var includes = new StringBuilder();
+      foreach (Source node in files) {
+        string text = em.EmitFile(node);
+        if (text == null) continue;
+        string outFile = cppFolder + "/" + Path.GetFileName(node.cppFile);
+        File.WriteAllText(outFile, text);
+        includes.Append("#include \"" + Path.GetFileName(node.cppFile) + "\"\n");
+      }
+      if (em.errors.Count > 0) {
+        foreach (var err in em.errors) Console.WriteLine(err);
+        Console.WriteLine("CCSharp --crust: " + em.errors.Count + " construct(s) outside the Crust C# subset");
+        Environment.Exit(1);
+      }
+      if (CrustEmitter.entryCall == null && !library) {
+        Console.WriteLine("Error: no `static int Main()` / `static void Main()` / `Main(string[] args)` found" + (main != null ? " in " + main : ""));
+        Environment.Exit(1);
+      }
+      string aggregate = "#include <stdio.h>\n" + (em.UsesStrcmp ? "#include <string.h>\n" : "") + (em.UsesString ? "#include <string>\n" : "") + includes.ToString() + (library ? "" : em.EmitMain());
+      File.WriteAllText(cppFolder + "/" + target + ".cpp", aggregate);
+      Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".cpp");
+    }
+
+    /** a file whose types use another file's types comes after it. */
+    List<Source> CrustOrder(List<Source> list)
+    {
+      var declaredIn = new Dictionary<ISymbol, Source>(SymbolEqualityComparer.Default);
+      foreach (var f in list) {
+        foreach (var d in f.tree.GetRoot().DescendantNodes().OfType<BaseTypeDeclarationSyntax>()) {
+          var s = f.model.GetDeclaredSymbol(d);
+          if (s != null) declaredIn[s] = f;
+        }
+      }
+      var deps = new Dictionary<Source, HashSet<Source>>();
+      foreach (var f in list) {
+        var set = new HashSet<Source>();
+        foreach (var n in f.tree.GetRoot().DescendantNodes().OfType<IdentifierNameSyntax>()) {
+          var sym = f.model.GetSymbolInfo(n).Symbol;
+          INamedTypeSymbol t = sym as INamedTypeSymbol ?? sym?.ContainingType;
+          while (t != null) {
+            if (declaredIn.TryGetValue(t.OriginalDefinition, out var other) && other != f) { set.Add(other); break; }
+            t = t.ContainingType;
+          }
+        }
+        deps[f] = set;
+      }
+      var result = new List<Source>();
+      var state = new Dictionary<Source, int>();
+      void Visit(Source f) {
+        if (state.TryGetValue(f, out int st) && st != 0) return;
+        state[f] = 1;
+        foreach (var d in deps[f].OrderBy(x => x.csFile, StringComparer.Ordinal)) Visit(d);
+        result.Add(f);
+        state[f] = 2;
+      }
+      foreach (var f in list.OrderBy(x => x.csFile, StringComparer.Ordinal)) Visit(f);
+      return result;
+    }
+
+    void AddFolderSorted(string folder)
+    {
+      foreach (var file in Directory.GetFiles(folder).OrderBy(x => x, StringComparer.Ordinal)) {
+        if (file.EndsWith(".cs") && !file.Contains("NETCoreApp")) AddFile(file);
+      }
+      foreach (var sub in Directory.GetDirectories(folder).OrderBy(x => x, StringComparer.Ordinal)) {
+        AddFolderSorted(sub);
       }
     }
 
