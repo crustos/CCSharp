@@ -109,6 +109,14 @@ class CrustEmitter
 
   public CrustEmitter(string mainClass) { this.mainClass = mainClass; }
 
+  /** The semantic model that can answer questions about `node`. `model` only knows the file being emitted: a class declared in
+      another file has its base list in another syntax tree, and asking the wrong model throws "Syntax node is not within syntax tree". */
+  SemanticModel ModelOf(SyntaxNode node)
+  {
+    if (node.SyntaxTree == model.SyntaxTree) return model;
+    return Program.compiler.GetSemanticModel(node.SyntaxTree);
+  }
+
   // ------------------------------------------------------------------ entry points
 
   /** Emit one source file.  Returns the C++ text, or null when the file was refused. */
@@ -1255,7 +1263,7 @@ class CrustEmitter
       //the first base listed in the declaration is the layout base, whether class or interface
       var decl = t.DeclaringSyntaxReferences.Select(r => r.GetSyntax()).OfType<TypeDeclarationSyntax>().FirstOrDefault();
       if (decl == null || decl.BaseList == null || decl.BaseList.Types.Count == 0) return false;
-      var first = model.GetSymbolInfo(decl.BaseList.Types[0].Type).Symbol as INamedTypeSymbol;
+      var first = ModelOf(decl).GetSymbolInfo(decl.BaseList.Types[0].Type).Symbol as INamedTypeSymbol;
       if (first == null) return false;
       if (first.TypeKind == TypeKind.Interface) return SymbolEqualityComparer.Default.Equals(first.OriginalDefinition, to.OriginalDefinition);
       t = first;
@@ -1265,7 +1273,7 @@ class CrustEmitter
       while (true) {
         var d2 = next.DeclaringSyntaxReferences.Select(r => r.GetSyntax()).OfType<TypeDeclarationSyntax>().FirstOrDefault();
         if (d2 == null || d2.BaseList == null || d2.BaseList.Types.Count == 0) return false;
-        var f2 = model.GetSymbolInfo(d2.BaseList.Types[0].Type).Symbol as INamedTypeSymbol;
+        var f2 = ModelOf(d2).GetSymbolInfo(d2.BaseList.Types[0].Type).Symbol as INamedTypeSymbol;
         if (f2 == null) return false;
         if (SymbolEqualityComparer.Default.Equals(f2.OriginalDefinition, to.OriginalDefinition)) return true;
         if (f2.TypeKind == TypeKind.Interface) return false;
@@ -2121,8 +2129,18 @@ class CrustEmitter
         int bits = BitWidth(model.GetTypeInfo(b).Type);
         return "(" + left + " " + op + " (" + Expr(b.Right) + " & " + (bits - 1) + "))";
       }
+      if (op == "%" && IsFloating(model.GetTypeInfo(b).Type)) {
+        //C and C++ have no % on floating point; C#'s is the truncated remainder, which is fmod
+        Includes.Add("\"cs/math.h\"");
+        return (model.GetTypeInfo(b).Type.SpecialType == SpecialType.System_Single ? "cs_fmodf(" : "cs_fmod(") + left + ", " + Expr(b.Right) + ")";
+      }
       return left + " " + op + " " + Expr(b.Right);
     } finally { hoistRoot = saveRoot; }
+  }
+
+  static bool IsFloating(ITypeSymbol t)
+  {
+    return t != null && (t.SpecialType == SpecialType.System_Single || t.SpecialType == SpecialType.System_Double);
   }
 
   int BitWidth(ITypeSymbol t)
@@ -2220,6 +2238,14 @@ class CrustEmitter
       return Expr(a.Left) + " " + op + " (" + Expr(a.Right) + " & " + (bits - 1) + ")";
     }
     if (op == ">>>=") Refuse(a, "`>>>=` is not in the Crust C# subset.");
+    if (op == "%=" && IsFloating(lt)) {
+      //x %= y  ->  x = fmod(x, y): the left side is written twice, so it must not have a side effect
+      if (IsImpure(a.Left))
+        Refuse(a, "`%=` on a floating-point value whose left side has a side effect: C has no float %, so the left side would be evaluated twice. Use a local.");
+      Includes.Add("\"cs/math.h\"");
+      string fn = lt.SpecialType == SpecialType.System_Single ? "cs_fmodf" : "cs_fmod";
+      return Expr(a.Left) + " = " + fn + "(" + Expr(a.Left) + ", " + Expr(a.Right) + ")";
+    }
     return Expr(a.Left) + " " + op + " " + Expr(a.Right);
   }
 
