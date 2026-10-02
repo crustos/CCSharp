@@ -53,6 +53,7 @@ namespace CCSharpCompiler;
     public static bool no_npe_checks = false;
     public static bool no_abe_checks = false;
     public static bool crust = true;           //the Crust back end is the default; --gc selects the legacy GC back end
+    public static string srcListPath;          //--srclist=FILE : the C# files of the program, one per line (a whole project, or several folders)
     public static string corelibPath;          //--corelib=DIR : the C# corelib sources (default: found from --home / the compiler)
     public static string coostPath;            //--coost=DIR   : informational, build.py passes it to the C++ side
     public static string crustPath;            //--crust=DIR   : informational, build.py passes it to the C++ side
@@ -93,8 +94,9 @@ namespace CCSharpCompiler;
         Console.WriteLine("    create console app");
         Console.WriteLine("  --crust");
         Console.WriteLine("    emit the C++ subset accepted by Crust (cpprust).  This is the default.");
-        Console.WriteLine("  --gc");
-        Console.WriteLine("    the legacy back end (GC C++ over the old corelib in legacy/corelib-gc).  Unmaintained.");
+        Console.WriteLine("  --srclist=file");
+        Console.WriteLine("    the program's C# files, one path per line, instead of every .cs under cs_folder.");
+        Console.WriteLine("    (build.py expands folders, .csproj and .sln files into this list)");
         Console.WriteLine("  --corelib=dir");
         Console.WriteLine("    the C# corelib sources (default: corelib/src found from --home or from the compiler)");
         return;
@@ -146,7 +148,11 @@ namespace CCSharpCompiler;
           if (value.Length > 0) crustPath = value;
         }
         if (arg == "--gc") {
-          crust = false;
+          Console.WriteLine("Error: the GC back end was removed with its corelib (see the git history before the Crust corelib).  CC# now emits Crust C++ only.");
+          Environment.Exit(1);
+        }
+        if (arg == "--srclist" && value.Length > 0) {
+          srcListPath = value;
         }
         if (arg == "--corelib" && value.Length > 0) {
           corelibPath = value.Replace("\\", "/");
@@ -309,7 +315,8 @@ namespace CCSharpCompiler;
     void ProcessCrust()
     {
       compiler = CSharpCompilation.Create("C#");
-      compiler = compiler.WithOptions(compiler.Options.WithOutputKind(OutputKind.ConsoleApplication).WithAllowUnsafe(true));
+      compiler = compiler.WithOptions(compiler.Options.WithOutputKind(OutputKind.DynamicallyLinkedLibrary).WithAllowUnsafe(true));
+      //(a library: nothing is emitted, and the entry point is chosen by CC# -- see --main -- not by Roslyn's CS0017)
       //The corelib is C# source compiled as part of the program, INSTEAD of the .NET reference assemblies:
       //it declares System.Object and the rest, so it is also the whole of what a program can name.
       string corelibDir = FindCorelib();
@@ -321,7 +328,7 @@ namespace CCSharpCompiler;
       }
       path_sep = "/";
       ext_obj = ".o";
-      AddFolderSorted(csFolder);
+      AddProgramFiles();
       bool failed = false;
       foreach (var diag in compiler.GetDiagnostics()) {
         if (diag.Severity != DiagnosticSeverity.Error) continue;
@@ -360,13 +367,48 @@ namespace CCSharpCompiler;
       }
       var inc = new StringBuilder("#include <stdio.h>\n");
       if (em.UsesStrcmp) inc.Append("#include <string.h>\n");
+      if (em.UsesString) em.Includes.Add("\"cs/core.h\"");                    //fastring, whichever way the string came about
       foreach (var h in em.Includes) inc.Append("#include " + h + "\n");      //what the corelib members used need
+      if (!library && main == null && CrustEmitter.entryCandidates.Count > 1) {
+        Console.WriteLine("Error: " + CrustEmitter.entryCandidates.Count + " entry points: "
+          + string.Join(", ", CrustEmitter.entryCandidates.Select(c => c.Replace("::Main", ".Main").Replace("_", "."))) + "\n  Say which one with --main=Class.");
+        Environment.Exit(1);
+      }
       string aggregate = inc.ToString() + includes.ToString() + (library ? "" : em.EmitMain());
-      File.WriteAllText(cppFolder + "/" + target + ".cpp", aggregate);
-      Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".cpp");
+      File.WriteAllText(cppFolder + "/" + target + ".main.cpp", aggregate);   //".main.cpp": a file's own output never has a dot in its stem, so this cannot collide
+      Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".main.cpp");
     }
 
     public static List<SyntaxTree> libTrees = new List<SyntaxTree>();
+
+    /** The program's files: --srclist, or a single .cs file, or every .cs under the folder.  Files are named relative to
+        their common folder, so two Util.cs in different folders stay two files, and diagnostics keep the original paths. */
+    void AddProgramFiles()
+    {
+      List<string> list = null;
+      if (srcListPath != null) {
+        list = File.ReadAllLines(srcListPath).Select(l => l.Trim()).Where(l => l.Length > 0 && !l.StartsWith("#")).ToList();
+      } else if (File.Exists(csFolder)) {
+        list = new List<string> { csFolder };
+      }
+      if (list == null) {
+        csFolder = Path.GetFullPath(csFolder).TrimEnd('/', '\\');
+        AddFolderSorted(csFolder);
+        return;
+      }
+      var full = list.Select(f => Path.GetFullPath(f).Replace("\\", "/")).Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+      foreach (var f in full) {
+        if (!File.Exists(f)) { Console.WriteLine("Error: source file not found: " + f); Environment.Exit(1); }
+      }
+      if (full.Count == 0) { Console.WriteLine("Error: no C# files in the program."); Environment.Exit(1); }
+      //the common folder
+      string root = Path.GetDirectoryName(full[0]).Replace("\\", "/");
+      foreach (var f in full) {
+        while (!(f + "/").StartsWith(root.TrimEnd('/') + "/")) root = Path.GetDirectoryName(root).Replace("\\", "/");
+      }
+      csFolder = root.TrimEnd('/');
+      foreach (var f in full) AddFile(f);
+    }
 
     /** corelib/src: --corelib=DIR, else $home/corelib/src, else found by walking up from the compiler's own folder. */
     string FindCorelib()

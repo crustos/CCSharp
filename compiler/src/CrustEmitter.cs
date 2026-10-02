@@ -431,7 +431,7 @@ class CrustEmitter
         var init = v.Initializer.Value;
         if (fs.Type.SpecialType == SpecialType.System_String)
           Refuse(init, "a string field initialiser is not in the Crust C# subset yet. Assign it in the constructor; until then the field is the empty string.");
-        if (init is ObjectCreationExpressionSyntax oc && IsOwnedClass(fs.Type)) {
+        if (init is ObjectCreationExpressionSyntax oc && (IsOwnedClass(fs.Type) || CppTemplate(fs.Type) != null)) {
           if (oc.ArgumentList != null && oc.ArgumentList.Arguments.Count > 0)
             Refuse(init, "a class-typed field initialised with constructor arguments is not supported by CC# --crust yet. Assign it in the constructor.");
           //default constructor runs when the owner is built
@@ -662,12 +662,16 @@ class CrustEmitter
     return true;
   }
 
+  public static List<string> entryCandidates = new List<string>();   //every usable `static Main`, to report an ambiguity
+
   void RegisterEntry(INamedTypeSymbol owner, IMethodSymbol ms)
   {
-    if (entryCall != null) return;                      //first Main wins (or --main=Class)
     if (ms.ReturnType.SpecialType != SpecialType.System_Int32 && !ms.ReturnsVoid) return;
     if (ms.Parameters.Length > 1) return;
     if (ms.Parameters.Length == 1 && !(ms.Parameters[0].Type is IArrayTypeSymbol)) return;
+    string call = FlatName(owner) + "::Main";
+    if (!entryCandidates.Contains(call)) entryCandidates.Add(call);
+    if (entryCall != null) return;                      //the first wins; Program reports it when there are several
     entryCall = FlatName(owner) + "::Main";
     entryReturnsInt = !ms.ReturnsVoid;
     entryTakesArgs = ms.Parameters.Length == 1;
@@ -1686,7 +1690,10 @@ class CrustEmitter
     if (inner is ElementAccessExpressionSyntax ea && IsMainArgs(ea.Expression)) {
       RequireHoist(e, "an element of `args`");
       string a = NewTemp("_s");
-      hoisted.Add("fastring " + a + " = fastring::from_cstr(" + Expr(ea.Expression) + "[" + Expr(ea.ArgumentList.Arguments[0].Expression) + "]);");
+      //cpprust does not lower `v[i]` inside the arguments of a static call: read the element into a plain name first
+      string cp = NewTemp("_p");
+      hoisted.Add("const char *" + cp + " = " + Expr(ea.Expression) + "[" + Expr(ea.ArgumentList.Arguments[0].Expression) + "];");
+      hoisted.Add("fastring " + a + " = fastring::from_cstr(" + cp + ");");
       return a;
     }
     var parts = new List<object>();
