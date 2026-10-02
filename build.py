@@ -1,32 +1,47 @@
 #!/usr/bin/env python3
-"""build.py -- build CC# (C# -> the C++ subset of Crust) and the two things it requires, offline.
+"""build.py -- build CC# (C# -> the C++ subset of Crust) and the two things it requires, offline; and use it.
 
 CC# needs two sibling checkouts, beside this repository:
 
-    ../crust    https://github.com/brentharts/crust   cpprust (C++ subset -> C) and shivyc (the C compiler)
+    ../crust    https://github.com/brentharts/crust   cpprust (C++ subset -> C); its shivyc is an optional C compiler
     ../coost    https://github.com/crustos/coost      the string / fs / path / time library the corelib sits on
 
+BUILD
     python3 build.py                  deps, compiler, coost, corelib, test, examples
     python3 build.py deps             clone crust and coost beside this repo (the only step that needs a network)
     python3 build.py compiler         build build/compiler/ccs.dll with the Roslyn inside the .NET SDK (no NuGet)
-    python3 build.py coost            build coost with its own build.py (and `--test` runs its tests)
-    python3 build.py corelib          check the corelib: C# compiles, native helpers lower and compile
-    python3 build.py test [names..]   crust/run_tests.py: each case vs real .NET, via cpprust+gcc and shivyc
+    python3 build.py coost            build coost with its own build.py (`--test` also runs coost's tests)
+    python3 build.py corelib          check the corelib: the C# compiles, the native helpers lower and compile
+    python3 build.py test [names..]   input tests, then every case in crust/tests vs real .NET (gcc)
     python3 build.py examples         build and run examples/*
-    python3 build.py run SRC_DIR      compile a C# folder to a native executable and run it
-    python3 build.py compile SRC_DIR -o EXE [--shivyc]
-    python3 build.py status           what was found, and where
-    python3 build.py clean
+    python3 build.py status | clean
 
-Options:
+USE   INPUT is any mix of C# files, folders, .csproj and .sln: together they are ONE program
+    python3 build.py convert INPUT.. [-o DIR] [--c]     write the generated C++ (and with --c, one self-contained C file)
+    python3 build.py compile INPUT.. [-o EXE]           build a native executable (default build/bin/NAME)
+    python3 build.py run     INPUT.. [-- ARGS..]        compile and run it; ARGS go to the program
+
+    python3 build.py run examples/example1/src
+    python3 build.py compile src/ extra/Helpers.cs -o app
+    python3 build.py compile MyApp/MyApp.csproj --main MyApp.Program      (its ProjectReferences come along)
+    python3 build.py convert Everything.sln -o generated --c
+
+OPTIONS
+    -o PATH          the output: executable (compile) or folder (convert)
+    --main CLASS     the class whose static Main is the entry point (needed if there are several)
+    --name NAME      the program's name (default: from the first input)
+    --c              convert: also write the lowered C
+    --cc CC          the C compiler (default: $CC, else cc / gcc)
+    --debug          compile with -g -O0 instead of -O2
+    --shivyc         use Crust's own compiler (shivyc) instead of gcc.  Experimental: see README.md.
+                     With `test` (or no command): also compile each test case with shivyc and require agreement.
     --offline        never touch the network: a missing dependency is an error that says what to clone
-    --update         `git pull --ff-only` the dependencies (deps)
-    --shivyc         compile with Crust's own compiler instead of gcc (compile / run)
+    --update         deps: `git pull --ff-only` the dependencies
     --no-test        with no command: skip the test step
-    --no-shivyc      test: skip the shivyc stage
+    --test           coost: also run coost's own tests
 
-Environment:  CRUST_HOME, COOST_HOME (dependency locations), DOTNET (the dotnet executable), CC.
-Needs:        python3, git (deps only), a C compiler, and the .NET SDK 8+ (its Roslyn compiles the compiler).
+ENVIRONMENT   CRUST_HOME, COOST_HOME (dependency locations), DOTNET (the dotnet executable), CC (the C compiler)
+NEEDS         python3, git (deps only), a C compiler, and the .NET SDK 8+ (its Roslyn compiles the compiler)
 """
 import glob
 import hashlib
@@ -269,25 +284,43 @@ def cmd_corelib(opts):
 # ---- tests and examples -------------------------------------------------------------------------------------------
 
 def cmd_test(opts):
-    step("tests (each case vs real .NET; cpprust+gcc and shivyc)")
+    step("tests (each case vs real .NET, compiled with gcc%s)" % (" and shivyc" if opts["shivyc"] else ""))
     require_deps()
     require_compiler()
     env = env_for_children()
-    if opts["no_shivyc"]:
-        env["NO_SHIVYC"] = "1"
+    if opts["shivyc"]:
+        env["SHIVYC"] = "1"
+    if opts["cc"]:
+        env["CC"] = opts["cc"]
     if not shutil.which("dotnet"):
         say("  note: no dotnet, so there is no .NET reference to compare with")
+    if not opts["names"]:
+        run([sys.executable, os.path.join(ROOT, "crust", "test_inputs.py")], env=env)          # what counts as a program
     run([sys.executable, os.path.join(ROOT, "crust", "run_tests.py")] + opts["names"], env=env)
 
 
-def sources_of(d):
-    return os.path.join(d, "src") if os.path.isdir(os.path.join(d, "src")) else d
+def ccs2c_cmd(opts, *extra):
+    """crust/ccs2c.py on the user's inputs with the options that apply to every use."""
+    if not opts["names"]:
+        die("no input: give a .cs file, a folder, a .csproj or a .sln")
+    cmd = [sys.executable, os.path.join(ROOT, "crust", "ccs2c.py")] + opts["names"]
+    if opts["main"]:
+        cmd.append("--main=" + opts["main"])
+    if opts["name"]:
+        cmd.append("--name=" + opts["name"])
+    if opts["cc"]:
+        cmd.append("--cc=" + opts["cc"])
+    if opts["debug"]:
+        cmd.append("--debug")
+    if opts["shivyc"]:
+        cmd.append("--shivyc")
+    return cmd + list(extra)
 
 
-def label_of(d):
-    """examples/example1/src -> example1"""
-    d = os.path.abspath(d)
-    return os.path.basename(os.path.dirname(d)) if os.path.basename(d) == "src" else os.path.basename(d)
+def program_name(opts):
+    sys.path.insert(0, os.path.join(ROOT, "crust"))
+    import inputs
+    return opts["name"] or inputs.project_name(opts["names"])
 
 
 def cmd_examples(opts):
@@ -299,7 +332,10 @@ def cmd_examples(opts):
     for ex in sorted(glob.glob(os.path.join(ROOT, "examples", "*"))):
         name = os.path.basename(ex)
         exe = os.path.join(BUILD, "examples", name)
-        run([sys.executable, os.path.join(ROOT, "crust", "ccs2c.py"), sources_of(ex), "--exe", exe], env=env, quiet=True)
+        cmd = [sys.executable, os.path.join(ROOT, "crust", "ccs2c.py"), ex, "--name=" + name, "--exe=" + exe]
+        if opts["cc"]:
+            cmd.append("--cc=" + opts["cc"])
+        run(cmd, env=env, quiet=True)
         r = subprocess.run([exe], stdout=subprocess.PIPE, universal_newlines=True)
         say("  %-10s rc=%d  %s" % (name, r.returncode, " | ".join(r.stdout.strip().splitlines())[:90]))
 
@@ -307,26 +343,29 @@ def cmd_examples(opts):
 def cmd_run(opts):
     require_deps()
     require_compiler()
-    if not opts["names"]:
-        die("run needs a source folder")
-    exe = os.path.join(BUILD, "run", label_of(opts["names"][0]))
-    cmd = [sys.executable, os.path.join(ROOT, "crust", "ccs2c.py"), sources_of(opts["names"][0]), "--exe", exe]
-    if opts["shivyc"]:
-        cmd.append("--shivyc")
-    run(cmd, env=env_for_children(), quiet=True)
-    sys.exit(subprocess.run([exe]).returncode)
+    r = subprocess.run(ccs2c_cmd(opts, "--run", "--", *opts["rest"]), env=env_for_children())
+    sys.exit(r.returncode)
+
+
+def tool(cmd):
+    """Run crust/ccs2c.py.  Its output IS the result (diagnostics, `built X`), so a failure just passes its status on."""
+    r = subprocess.run(cmd, env=env_for_children())
+    if r.returncode != 0:
+        sys.exit(r.returncode)
 
 
 def cmd_compile(opts):
     require_deps()
     require_compiler()
-    if not opts["names"] or not opts["out"]:
-        die("usage: build.py compile SRC_DIR -o EXE [--shivyc]")
-    cmd = [sys.executable, os.path.join(ROOT, "crust", "ccs2c.py"), sources_of(opts["names"][0]), "--exe", os.path.abspath(opts["out"])]
-    if opts["shivyc"]:
-        cmd.append("--shivyc")
-    run(cmd, env=env_for_children(), quiet=True)
-    say("  built " + opts["out"])
+    exe = os.path.abspath(opts["out"]) if opts["out"] else os.path.join(BUILD, "bin", program_name(opts))
+    tool(ccs2c_cmd(opts, "--exe=" + exe))
+
+
+def cmd_convert(opts):
+    require_deps()
+    require_compiler()
+    dest = os.path.abspath(opts["out"]) if opts["out"] else os.path.join(BUILD, "convert", program_name(opts))
+    tool(ccs2c_cmd(opts, "--convert=" + dest, *(["--c"] if opts["c"] else [])))
 
 
 # ---- status / clean -----------------------------------------------------------------------------------------------
@@ -373,14 +412,17 @@ def cmd_all(opts):
 
 COMMANDS = {
     "all": cmd_all, "deps": cmd_deps, "compiler": cmd_compiler, "coost": cmd_coost, "corelib": cmd_corelib,
-    "test": cmd_test, "examples": cmd_examples, "run": cmd_run, "compile": cmd_compile, "status": cmd_status,
-    "clean": cmd_clean,
+    "test": cmd_test, "examples": cmd_examples, "run": cmd_run, "compile": cmd_compile, "convert": cmd_convert,
+    "status": cmd_status, "clean": cmd_clean,
 }
 
 
 def main(argv):
-    opts = {"offline": False, "update": False, "shivyc": False, "no_test": False, "no_shivyc": False,
-            "coost_test": False, "out": None, "names": []}
+    opts = {"offline": False, "update": False, "shivyc": False, "no_test": False, "coost_test": False, "c": False,
+            "debug": False, "out": None, "main": None, "name": None, "cc": None, "names": [], "rest": []}
+    value_opts = {"-o": "out", "--main": "main", "--name": "name", "--cc": "cc"}
+    flag_opts = {"--offline": "offline", "--update": "update", "--shivyc": "shivyc", "--no-test": "no_test",
+                 "--test": "coost_test", "--c": "c", "--debug": "debug"}
     cmd = None
     i = 0
     while i < len(argv):
@@ -388,28 +430,27 @@ def main(argv):
         if a in ("-h", "--help", "help"):
             print(__doc__)
             return 0
-        if a == "--offline":
-            opts["offline"] = True
-        elif a == "--update":
-            opts["update"] = True
-        elif a == "--shivyc":
-            opts["shivyc"] = True
-        elif a == "--no-test":
-            opts["no_test"] = True
-        elif a == "--no-shivyc":
-            opts["no_shivyc"] = True
-        elif a == "--test":
-            opts["coost_test"] = True
-        elif a == "-o":
+        if a == "--":
+            opts["rest"] = argv[i + 1:]
+            break
+        if a in flag_opts:
+            opts[flag_opts[a]] = True
+        elif a in value_opts:
             i += 1
-            opts["out"] = argv[i] if i < len(argv) else None
+            if i >= len(argv):
+                die("%s needs a value (see --help)" % a)
+            opts[value_opts[a]] = argv[i]
+        elif "=" in a and a.split("=", 1)[0] in value_opts:
+            opts[value_opts[a.split("=", 1)[0]]] = a.split("=", 1)[1]
         elif cmd is None and a in COMMANDS:
             cmd = a
-        elif a.startswith("-"):
+        elif a.startswith("-") and len(a) > 1:
             die("unknown option %s (see --help)" % a)
         else:
             opts["names"].append(a)
         i += 1
+    if cmd in ("compile", "convert", "run") or cmd is None:
+        pass
     COMMANDS[cmd or "all"](opts)
     return 0
 
