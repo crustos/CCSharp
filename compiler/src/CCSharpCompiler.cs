@@ -52,7 +52,10 @@ namespace CCSharpCompiler;
     public static bool debug = false;
     public static bool no_npe_checks = false;
     public static bool no_abe_checks = false;
-    public static bool crust = false;
+    public static bool crust = true;           //the Crust back end is the default; --gc selects the legacy GC back end
+    public static string corelibPath;          //--corelib=DIR : the C# corelib sources (default: found from --home / the compiler)
+    public static string coostPath;            //--coost=DIR   : informational, build.py passes it to the C++ side
+    public static string crustPath;            //--crust=DIR   : informational, build.py passes it to the C++ side
     public static List<string> refs = new List<string>();
     public static List<string> libs = new List<string>();
 
@@ -89,7 +92,11 @@ namespace CCSharpCompiler;
         Console.WriteLine("  --console");
         Console.WriteLine("    create console app");
         Console.WriteLine("  --crust");
-        Console.WriteLine("    emit the C++ subset accepted by Crust (cpprust) instead of GC C++");
+        Console.WriteLine("    emit the C++ subset accepted by Crust (cpprust).  This is the default.");
+        Console.WriteLine("  --gc");
+        Console.WriteLine("    the legacy back end (GC C++ over the old corelib in legacy/corelib-gc).  Unmaintained.");
+        Console.WriteLine("  --corelib=dir");
+        Console.WriteLine("    the C# corelib sources (default: corelib/src found from --home or from the compiler)");
         return;
       }
 
@@ -136,6 +143,16 @@ namespace CCSharpCompiler;
         }
         if (arg == "--crust") {
           crust = true;
+          if (value.Length > 0) crustPath = value;
+        }
+        if (arg == "--gc") {
+          crust = false;
+        }
+        if (arg == "--corelib" && value.Length > 0) {
+          corelibPath = value.Replace("\\", "/");
+        }
+        if (arg == "--coost" && value.Length > 0) {
+          coostPath = value.Replace("\\", "/");
         }
         if (arg == "--no-npe-checks") {
           no_npe_checks = true;
@@ -293,14 +310,14 @@ namespace CCSharpCompiler;
     {
       compiler = CSharpCompilation.Create("C#");
       compiler = compiler.WithOptions(compiler.Options.WithOutputKind(OutputKind.ConsoleApplication).WithAllowUnsafe(true));
-      //type information comes from the .NET reference assemblies; the CC# corelib is not used
-      var tpa = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") ?? "").Split(Path.PathSeparator);
-      foreach (var a in tpa) {
-        string n = Path.GetFileName(a);
-        if (n == "System.Private.CoreLib.dll" || n == "System.Runtime.dll" || n == "System.Console.dll"
-            || n == "System.Collections.dll" || n == "System.Linq.dll" || n == "netstandard.dll" || n == "mscorlib.dll") {
-          compiler = compiler.AddReferences(MetadataReference.CreateFromFile(a));
-        }
+      //The corelib is C# source compiled as part of the program, INSTEAD of the .NET reference assemblies:
+      //it declares System.Object and the rest, so it is also the whole of what a program can name.
+      string corelibDir = FindCorelib();
+      libTrees.Clear();
+      foreach (var f in Directory.GetFiles(corelibDir, "*.cs", SearchOption.AllDirectories).OrderBy(x => x, StringComparer.Ordinal)) {
+        var t = CSharpSyntaxTree.ParseText(File.ReadAllText(f), path: f);
+        libTrees.Add(t);
+        compiler = compiler.AddSyntaxTrees(t);
       }
       path_sep = "/";
       ext_obj = ".o";
@@ -309,7 +326,10 @@ namespace CCSharpCompiler;
       foreach (var diag in compiler.GetDiagnostics()) {
         if (diag.Severity != DiagnosticSeverity.Error) continue;
         if (diag.Id == "CS0626") continue;
-        if (diag.Location.SourceTree != null) Console.Write(FindTree(diag.Location.SourceTree) + ": ");
+        if (diag.Location.SourceTree != null) {
+          if (libTrees.Contains(diag.Location.SourceTree)) Console.Write("corelib " + diag.Location.SourceTree.FilePath + ": ");
+          else Console.Write(FindTree(diag.Location.SourceTree) + ": ");
+        }
         Console.WriteLine(diag.ToString());
         failed = true;
       }
@@ -338,9 +358,35 @@ namespace CCSharpCompiler;
         Console.WriteLine("Error: no `static int Main()` / `static void Main()` / `Main(string[] args)` found" + (main != null ? " in " + main : ""));
         Environment.Exit(1);
       }
-      string aggregate = "#include <stdio.h>\n" + (em.UsesStrcmp ? "#include <string.h>\n" : "") + (em.UsesString ? "#include <string>\n" : "") + includes.ToString() + (library ? "" : em.EmitMain());
+      var inc = new StringBuilder("#include <stdio.h>\n");
+      if (em.UsesStrcmp) inc.Append("#include <string.h>\n");
+      foreach (var h in em.Includes) inc.Append("#include " + h + "\n");      //what the corelib members used need
+      string aggregate = inc.ToString() + includes.ToString() + (library ? "" : em.EmitMain());
       File.WriteAllText(cppFolder + "/" + target + ".cpp", aggregate);
       Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".cpp");
+    }
+
+    public static List<SyntaxTree> libTrees = new List<SyntaxTree>();
+
+    /** corelib/src: --corelib=DIR, else $home/corelib/src, else found by walking up from the compiler's own folder. */
+    string FindCorelib()
+    {
+      var tried = new List<string>();
+      var cands = new List<string>();
+      if (corelibPath != null) cands.Add(corelibPath);
+      cands.Add(Path.Combine(home, "corelib", "src"));
+      string d = AppContext.BaseDirectory;
+      for (int i = 0; i < 6 && d != null; i++) {
+        cands.Add(Path.Combine(d, "corelib", "src"));
+        d = Path.GetDirectoryName(d.TrimEnd('/', '\\'));
+      }
+      foreach (var c in cands) {
+        tried.Add(c);
+        if (Directory.Exists(c) && File.Exists(Path.Combine(c, "System", "Core.cs"))) return Path.GetFullPath(c);
+      }
+      Console.WriteLine("Error: the corelib was not found.  Looked in:\n  " + string.Join("\n  ", tried) + "\nPass --corelib=DIR or --home=DIR (the CCSharp checkout).");
+      Environment.Exit(1);
+      return null;
     }
 
     /** a file whose types use another file's types comes after it. */

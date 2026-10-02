@@ -93,8 +93,9 @@ class CrustEmitter
   List<string> hoisted = new List<string>();     //statements emitted just before the current statement, in order
   bool canHoist;
   ExpressionSyntax hoistRoot;                    //a composite whose parts are hoisted strictly in order
-  public bool UsesString;                        //aggregate file needs <string>
+  public bool UsesString;                        //a string value is built somewhere (the aggregate file needs fastring)
   public bool UsesStrcmp;                        //... and <string.h>
+  public SortedSet<string> Includes = new SortedSet<string>(StringComparer.Ordinal);   //headers the corelib members used need
   IMethodSymbol entryMethod;                     //Main, whose string[] args are `const char *` elements
 
   static readonly HashSet<string> reserved = new HashSet<string> {
@@ -546,7 +547,7 @@ class CrustEmitter
         Refuse(p.Initializer, "a string property initialiser is not in the Crust C# subset yet. Assign it in the constructor.");
       foreach (var a in accs) {
         if (a.IsKind(SyntaxKind.GetAccessorDeclaration) && strProp)
-          sb.Append(" " + st + virt + t + " get_" + name + "() { std::string _r(" + (isStatic ? "" : "this->") + "_" + name + "); return _r; }");
+          sb.Append(" " + st + virt + t + " get_" + name + "() { fastring _r(" + (isStatic ? "" : "this->") + "_" + name + "); return _r; }");
         else if (a.IsKind(SyntaxKind.GetAccessorDeclaration))
           sb.Append(" " + st + virt + t + " get_" + name + "() { return " + (isStatic ? "" : "this->") + "_" + name + "; }");
         else if (a.IsKind(SyntaxKind.SetAccessorDeclaration))
@@ -696,6 +697,110 @@ class CrustEmitter
     Block(dd.Body);
   }
 
+  // ------------------------------------------------------------------ the corelib mapping ([Cpp])
+
+  /** the C++ template a corelib declaration carries, or null. */
+  string CppTemplate(ISymbol s)
+  {
+    if (s == null) return null;
+    foreach (var a in s.OriginalDefinition.GetAttributes())
+      if (a.AttributeClass != null && a.AttributeClass.Name == "CppAttribute" && a.ConstructorArguments.Length == 1)
+        return a.ConstructorArguments[0].Value as string;
+    return null;
+  }
+
+  bool HasCppAttr(ISymbol s, string name)
+  {
+    return s != null && s.OriginalDefinition.GetAttributes().Any(a => a.AttributeClass != null && a.AttributeClass.Name == name);
+  }
+
+  /** headers named by [CppInclude] on the member and on the types around it. */
+  void AddIncludes(ISymbol s)
+  {
+    for (var x = s == null ? null : s.OriginalDefinition; x != null; x = x.ContainingType)
+      foreach (var a in x.GetAttributes())
+        if (a.AttributeClass != null && a.AttributeClass.Name == "CppIncludeAttribute" && a.ConstructorArguments.Length == 1)
+          Includes.Add((string)a.ConstructorArguments[0].Value);
+  }
+
+  /** declared in the corelib sources (as opposed to the user's program). */
+  bool IsLib(ISymbol s)
+  {
+    return s != null && s.OriginalDefinition.Locations.Any(l => l.SourceTree != null && Program.libTrees.Contains(l.SourceTree));
+  }
+
+  void RefuseUnimplemented(SyntaxNode at, ISymbol s)
+  {
+    string what = s is INamedTypeSymbol nt ? nt.ToDisplayString() : (s.ContainingType != null ? s.ContainingType.ToDisplayString() + "." : "") + s.Name;
+    Refuse(at, "`" + what + "` is declared in the CC# corelib (the .NET surface) but has no Crust implementation yet. See corelib/src, and the [Cpp] attributes there for what exists.");
+  }
+
+  ExpressionSyntax Unparen(ExpressionSyntax e)
+  {
+    while (e is ParenthesizedExpressionSyntax p) e = p.Expression;
+    return e;
+  }
+
+  /** a corelib method that returns its receiver: `sb.Append(a).Append(b)` is one statement per call. */
+  bool IsCppFluentCall(ExpressionSyntax e)
+  {
+    return Unparen(e) is InvocationExpressionSyntax inv
+      && HasCppAttr(model.GetSymbolInfo(inv).Symbol, "CppFluentAttribute");
+  }
+
+  /** the receiver of a corelib call as C++ text.  A fluent chain is flattened: every earlier call in it is
+      emitted as its own statement, in order, and the receiver is the variable at the start of the chain. */
+  string RecvText(ExpressionSyntax recv)
+  {
+    var u = Unparen(recv);
+    if (IsCppFluentCall(u)) {
+      var inner = (InvocationExpressionSyntax)u;
+      var ima = inner.Expression as MemberAccessExpressionSyntax;
+      if (ima == null) Refuse(inner, "a chained call needs a receiver.");
+      var baseExpr = ima.Expression;
+      var b = Unparen(baseExpr);
+      if (!IsCppFluentCall(b) && !(b is IdentifierNameSyntax || b is MemberAccessExpressionSyntax || b is ElementAccessExpressionSyntax))
+        Refuse(baseExpr, "a chain of calls must start from a variable, not from `" + b.Kind() + "`. Put it in a local first.");
+      string stmt = Invocation(inner);                       //emits any earlier calls of the chain first
+      RequireHoist(inner, "a chained call");
+      hoisted.Add(stmt + ";");
+      while (IsCppFluentCall(b)) {                           //walk down to the variable the chain started from
+        var bi = (InvocationExpressionSyntax)b;
+        b = Unparen(((MemberAccessExpressionSyntax)bi.Expression).Expression);
+      }
+      return Expr(b);                                        //the same variable, named again
+    }
+    return Expr(u);
+  }
+
+  /** Expand a [Cpp] template.  {this} receiver, {0}.. arguments, {0:c} argument as `const char *`, {T0}.. type arguments. */
+  string Expand(string tpl, ISymbol sym, string recvText, IReadOnlyList<ArgumentSyntax> args, string[] argTexts, ITypeSymbol[] typeArgs, SyntaxNode at)
+  {
+    var sb = new StringBuilder();
+    for (int i = 0; i < tpl.Length; i++) {
+      char c = tpl[i];
+      if (c != '{') { sb.Append(c); continue; }
+      int j = tpl.IndexOf('}', i);
+      if (j < 0) { sb.Append(c); continue; }
+      string tok = tpl.Substring(i + 1, j - i - 1);
+      i = j;
+      if (tok == "this") {
+        if (recvText == null) Refuse(at, "`" + sym.Name + "` needs a receiver.");
+        sb.Append(recvText);
+      } else if (tok.Length > 0 && tok[0] == 'T' && int.TryParse(tok.Substring(1), out int ti)) {
+        sb.Append(TypeName(typeArgs[ti], at));
+      } else {
+        bool cstr = tok.EndsWith(":c");
+        string num = cstr ? tok.Substring(0, tok.Length - 2) : tok;
+        if (!int.TryParse(num, out int ai) || ai >= args.Count) { Refuse(at, "internal: bad placeholder {" + tok + "} in the template for `" + sym.Name + "`."); }
+        if (!cstr) sb.Append(argTexts[ai]);
+        else if (argTexts[ai] != null) sb.Append(argTexts[ai] + ".c_str()");      //already a named string
+        else sb.Append(StrCText(args[ai].Expression));                            //a constant: the literal itself
+      }
+    }
+    return sb.ToString();
+  }
+
   // ------------------------------------------------------------------ types
 
   string TypeName(ITypeSymbol t, SyntaxNode at = null)
@@ -718,7 +823,8 @@ class CrustEmitter
         break;
       case SpecialType.System_String:
         UsesString = true;
-        return "std::string";      //immutable in C#, so a by-value copy is indistinguishable from sharing
+        AddIncludes(t);
+        return "fastring";         //coost's string; immutable in C#, so a by-value copy is indistinguishable from sharing
       case SpecialType.System_Object:
         Refuse(at, "`object` is not in the Crust C# subset: there is no common base class and no boxing. Use an interface or a generic class.");
         break;
@@ -740,12 +846,19 @@ class CrustEmitter
         Refuse(at, "delegates are not in the Crust C# subset. Use an interface with one method.");
       if (n.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T || n.Name == "Nullable")
         Refuse(at, "`T?` (nullable value types) is not in the Crust C# subset. Use a bool flag beside the value.");
-      string full = n.OriginalDefinition.ToDisplayString();
-      if (full == "System.Collections.Generic.List<T>") return "std::vector<" + TypeName(n.TypeArguments[0], at) + ">";
-      if (full == "System.Collections.Generic.Dictionary<TKey, TValue>")
-        return "std::map<" + TypeName(n.TypeArguments[0], at) + ", " + TypeName(n.TypeArguments[1], at) + ">";
-      if (n.ContainingNamespace != null && n.ContainingNamespace.ToDisplayString().StartsWith("System"))
-        Refuse(at, "`" + n.ToDisplayString() + "` is not in the Crust C# subset: the .NET class library is not available. Crust provides List<T>, Dictionary<K,V> and Console.Write/WriteLine.");
+      if (n.OriginalDefinition.ToDisplayString() == "System.Collections.Generic.Dictionary<TKey, TValue>") {
+        var kt = n.TypeArguments[0];
+        bool okKey = kt.TypeKind == TypeKind.Enum || (kt.SpecialType >= SpecialType.System_Boolean && kt.SpecialType <= SpecialType.System_UInt64 && kt.SpecialType != SpecialType.System_Char);
+        if (!okKey)
+          Refuse(at, "a Dictionary key of type `" + kt.ToDisplayString() + "` is not supported yet: Crust orders map keys with a `compare` method, and coost's fastring has a different one. Use an int / enum key, or a List and a loop.");
+      }
+      string tpl = CppTemplate(n);
+      if (tpl != null) {                                  //a corelib type: how it is spelled in C++
+        AddIncludes(n);
+        var targs = n.TypeArguments.ToArray();
+        return Expand(tpl, n, null, new List<ArgumentSyntax>(), new string[0], targs, at);
+      }
+      if (IsLib(n)) RefuseUnimplemented(at, n);
       string name = FlatName(n);
       if (n.TypeArguments.Length > 0)
         name += "<" + string.Join(", ", n.TypeArguments.Select(a => TypeName(a, at))) + ">";
@@ -898,12 +1011,12 @@ class CrustEmitter
     UsesString = true;
     var inner = e;
     while (inner is ParenthesizedExpressionSyntax pp) inner = pp.Expression;
-    string n = Expr(inner);          //a named std::string: a local, a hoisted temporary, or a field / parameter
+    string n = Expr(inner);          //a named fastring: a local, a hoisted temporary, or a field / parameter
     if (inner is IdentifierNameSyntax id && model.GetSymbolInfo(id).Symbol is ILocalSymbol) return "return " + n + ";";
     if (n.StartsWith("_s") && n.All(ch => char.IsLetterOrDigit(ch) || ch == '_')) return "return " + n + ";";
     if (!canHoist) Refuse(e, "returning this string needs a temporary, which is not supported here.");
     string r = NewTemp("_r");
-    hoisted.Add("std::string " + r + "(" + n + ");");
+    hoisted.Add("fastring " + r + "(" + n + ");");
     return "return " + r + ";";
   }
 
@@ -1019,13 +1132,13 @@ class CrustEmitter
             Refuse(init, "`null` is not in the Crust C# subset: a string is a value here, empty at worst. Use \"\".");
             piece = "";
           } else if (icv.HasValue && icv.Value is string cs0) {
-            piece = (isConst ? "const " : "") + "std::string " + name + "(\"" + CLit(cs0) + "\")";
+            piece = (isConst ? "const " : "") + "fastring " + name + " = fastring::from_cstr(\"" + CLit(cs0) + "\")";
           } else if (IsStringLvalue(init) || IsStringCall(init)) {
-            piece = "std::string " + name + " = " + CallOrName(init);
+            piece = "fastring " + name + " = " + CallOrName(init);
           } else {
             //a concatenation / interpolation: build straight into the variable
             RequireHoist(init, "building this string");
-            hoisted.Add("std::string " + name + ";");
+            hoisted.Add("fastring " + name + ";");
             var sp = new List<object>();
             StringParts(init, sp);
             var saveRoot2 = hoistRoot; hoistRoot = init;
@@ -1076,9 +1189,9 @@ class CrustEmitter
     } else if (init is ImplicitObjectCreationExpressionSyntax ioc) {
       al = ioc.ArgumentList;
     }
-    var args = al == null ? new List<string>() : al.Arguments.Select(a => Arg(a)).ToList();
-    if (IsList(type) || IsDictionary(type)) {
-      if (args.Count > 0) Refuse(init, "`new " + type.Name + "(..)` with arguments is not in the Crust C# subset. Construct it empty and Add.");
+    var args = al == null ? new List<string>() : ArgTexts(al.Arguments, init).ToList();
+    if (CppTemplate(type) != null) {
+      if (args.Count > 0) Refuse(init, "`new " + type.Name + "(..)` with arguments is not in the Crust C# subset. Construct it empty and fill it.");
       return t + " " + name;
     }
     if (args.Count == 0) return t + " " + name;
@@ -1232,7 +1345,7 @@ class CrustEmitter
   {
     if (!statement && !recv && IsFluentCall(e))
       Refuse(e, "the result of a method that returns `this` can only start a chain or be dropped: storing it would alias the object, and a class is single-owner here. Call the methods on the original variable.");
-    //string-typed expressions: a named std::string (building it first when it is a composite)
+    //string-typed expressions: a named fastring (building it first when it is a composite)
     if (!(e is LiteralExpressionSyntax nl && nl.IsKind(SyntaxKind.NullLiteralExpression)) && !(e is AssignmentExpressionSyntax)) {
       var sti = model.GetTypeInfo(e).Type;
       if (sti != null && sti.SpecialType == SpecialType.System_String && !IsStringLvalue(e))
@@ -1262,6 +1375,8 @@ class CrustEmitter
       case ArrayCreationExpressionSyntax ac: return NewArray(ac);
       case ElementAccessExpressionSyntax ea:
         if (ea.ArgumentList.Arguments.Count != 1) Refuse(ea, "multi-index element access is not in the Crust C# subset.");
+        if (model.GetTypeInfo(ea.Expression).Type.SpecialType == SpecialType.System_String)
+          Refuse(ea, "`s[i]` is a `char`, which is not in the Crust C# subset (a C# char is UTF-16). Compare substrings: `s.Substring(i, 1) == \"x\"`.");
         return Expr(ea.Expression) + "[" + Expr(ea.ArgumentList.Arguments[0].Expression) + "]";
       case BinaryExpressionSyntax b: return Binary(b);
       case PrefixUnaryExpressionSyntax pu: return Prefix(pu, statement);
@@ -1329,7 +1444,7 @@ class CrustEmitter
     }
     if (e is ElementAccessExpressionSyntax ea) {
       var rt = model.GetTypeInfo(ea.Expression).Type;
-      if (IsMainArgs(ea.Expression)) return false;                    //`const char *` element: copied into a std::string
+      if (IsMainArgs(ea.Expression)) return false;                    //`const char *` element: copied into a fastring
       return rt is IArrayTypeSymbol || IsList(rt);
     }
     return false;
@@ -1372,12 +1487,130 @@ class CrustEmitter
     //an `if` condition or a `switch` subject is evaluated first and once; its bodies are not part of it
     if (scope is IfStatementSyntax ifs && ifs.Condition.Span.Contains(e.Span)) scope = ifs.Condition;
     else if (scope is SwitchStatementSyntax sw && sw.Expression.Span.Contains(e.Span)) scope = sw.Expression;
+    //an impure part that is evaluated only conditionally (the right of &&, ||, ??, or an arm of ?:) must not be
+    //hoisted: it would run unconditionally
+    if (IsImpure(e)) {
+      SyntaxNode child = e;
+      for (var par = e.Parent; par != null && par != scope.Parent; child = par, par = par.Parent) {
+        if ((par is BinaryExpressionSyntax pb && (pb.IsKind(SyntaxKind.LogicalAndExpression) || pb.IsKind(SyntaxKind.LogicalOrExpression) || pb.IsKind(SyntaxKind.CoalesceExpression)) && pb.Right == child)
+            || (par is ConditionalExpressionSyntax pc && (pc.WhenTrue == child || pc.WhenFalse == child)))
+          Refuse(e, what + " has side effects and is only conditionally evaluated here (right of `&&` / `||`, or an arm of `?:`): hoisting it would run it unconditionally. Evaluate it into a local first.");
+        if (par == scope) break;
+      }
+    }
     foreach (var n in scope.DescendantNodesAndSelf()) {
       if (!IsImpureNode(n)) continue;
       if (e.Span.Contains(n.Span) || n.Span.Contains(e.Span)) continue;
       if (hoistRoot != null && hoistRoot.Span.Contains(n.Span)) continue;
       Refuse(e, what + " would be built before the rest of this statement is evaluated, which changes what C# does (" + n.ToString().Split('\n')[0].Trim() + " has a side effect). Build it on its own line first.");
     }
+  }
+
+  // ------------------------------------------------------------------ evaluation order
+  //
+  // C# evaluates call arguments and binary operands strictly left to right.  C leaves the order unspecified, so
+  // wherever one part could observe or change what another does, the parts are evaluated into named temporaries,
+  // in order, and C is handed only names.  (That also keeps cpprust away from calls nested in the arguments of a
+  // free-function call, which it does not lower.)  Where that cannot be done -- a loop condition -- it is refused.
+
+  bool IsImpure(SyntaxNode n) { return n.DescendantNodesAndSelf().Any(IsImpureNode); }
+
+  static bool IsLocalLike(ISymbol sym)
+  {
+    return sym is ILocalSymbol || (sym is IParameterSymbol p && p.RefKind == RefKind.None);
+  }
+
+  /** does evaluating `n` read something other than locals and constants (a field, an element, a ref parameter, a property)? */
+  bool ReadsHeap(SyntaxNode n)
+  {
+    foreach (var x in n.DescendantNodesAndSelf()) {
+      if (x is ElementAccessExpressionSyntax) return true;
+      if (x is IdentifierNameSyntax id) {
+        var sym = model.GetSymbolInfo(id).Symbol;
+        if (sym is IFieldSymbol f && !f.IsConst && f.ContainingType.TypeKind != TypeKind.Enum) return true;
+        if (sym is IPropertySymbol) return true;
+        if (sym is IParameterSymbol p && p.RefKind != RefKind.None) return true;
+      }
+    }
+    return false;
+  }
+
+  HashSet<ISymbol> LocalReads(SyntaxNode n)
+  {
+    var set = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+    foreach (var x in n.DescendantNodesAndSelf().OfType<IdentifierNameSyntax>()) {
+      var sym = model.GetSymbolInfo(x).Symbol;
+      if (IsLocalLike(sym)) set.Add(sym);
+    }
+    return set;
+  }
+
+  /** the locals `n` assigns, increments or passes by ref/out; and whether it can change anything else. */
+  void Writes(SyntaxNode n, HashSet<ISymbol> locals, out bool heap)
+  {
+    heap = false;
+    foreach (var x in n.DescendantNodesAndSelf()) {
+      ExpressionSyntax target = null;
+      if (x is AssignmentExpressionSyntax a) target = a.Left;
+      else if (x is PrefixUnaryExpressionSyntax pr && (pr.IsKind(SyntaxKind.PreIncrementExpression) || pr.IsKind(SyntaxKind.PreDecrementExpression))) target = pr.Operand;
+      else if (x is PostfixUnaryExpressionSyntax po && (po.IsKind(SyntaxKind.PostIncrementExpression) || po.IsKind(SyntaxKind.PostDecrementExpression))) target = po.Operand;
+      else if (x is ArgumentSyntax ag && ag.RefKindKeyword.RawKind != 0) target = ag.Expression;
+      else if (x is InvocationExpressionSyntax || x is ObjectCreationExpressionSyntax || x is ImplicitObjectCreationExpressionSyntax) heap = true;
+      if (target == null) continue;
+      var t = Unparen(target);
+      var sym = t is IdentifierNameSyntax ? model.GetSymbolInfo(t).Symbol : null;
+      if (IsLocalLike(sym)) locals.Add(sym); else heap = true;
+    }
+  }
+
+  /** could evaluating `later` change what `earlier` sees (or do two side effects need their order)? */
+  bool Conflicts(ExpressionSyntax earlier, ExpressionSyntax later)
+  {
+    if (!IsImpure(later)) return false;                  //a pure later part cannot change anything
+    if (model.GetConstantValue(earlier).HasValue) return false;
+    if (IsImpure(earlier)) return true;                  //two side effects: their order is observable
+    var writes = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+    Writes(later, writes, out bool heapWrite);
+    if (heapWrite && ReadsHeap(earlier)) return true;
+    return LocalReads(earlier).Overlaps(writes);
+  }
+
+  bool ArgsNeedOrder(IReadOnlyList<ArgumentSyntax> args)
+  {
+    for (int i = 0; i < args.Count; i++)
+      for (int j = i + 1; j < args.Count; j++)
+        if (Conflicts(args[i].Expression, args[j].Expression)) return true;
+    return false;
+  }
+
+  /** Argument texts in C# order.  When the arguments conflict they are evaluated into temporaries, left to right.
+      `skip(i)` leaves an argument alone (a literal a template only uses as a `const char *`). */
+  string[] ArgTexts(IReadOnlyList<ArgumentSyntax> args, ExpressionSyntax call, Func<int, bool> skip = null)
+  {
+    var texts = new string[args.Count];
+    bool order = ArgsNeedOrder(args);
+    var saveRoot = hoistRoot;
+    if (order) {
+      RequireHoist(call, "arguments with side effects");
+      if (hoistRoot == null || !hoistRoot.Span.Contains(call.Span)) hoistRoot = call;   //never narrow an enclosing root
+    }
+    try {
+      for (int i = 0; i < args.Count; i++) {
+        if (skip != null && skip(i)) continue;
+        string t = Arg(args[i]);
+        if (order) {
+          var ty = model.GetTypeInfo(args[i].Expression).Type;
+          bool byRef = args[i].RefKindKeyword.RawKind != 0;
+          if (!byRef && ty != null && !Borrowed(ty) && ty.TypeKind != TypeKind.Interface && !model.GetConstantValue(args[i].Expression).HasValue) {
+            string tn = NewTemp("_a");
+            hoisted.Add(TypeName(ty, args[i]) + " " + tn + " = " + t + ";");
+            t = tn;
+          }
+        }
+        texts[i] = t;
+      }
+    } finally { hoistRoot = saveRoot; }
+    return texts;
   }
 
   bool IsImpureNode(SyntaxNode n)
@@ -1414,25 +1647,25 @@ class CrustEmitter
     parts.Add(e);
   }
 
-  /** Append one operand of a concatenation to the std::string `t`. */
+  /** Append one operand of a concatenation to the fastring `t`. */
   void AppendPart(string t, object part)
   {
-    if (part is string lit) { if (lit.Length > 0) hoisted.Add(t + ".append(\"" + CLit(lit) + "\");"); return; }
+    if (part is string lit) { if (lit.Length > 0) hoisted.Add(t + ".append_cstr(\"" + CLit(lit) + "\");"); return; }
     var e = (ExpressionSyntax)part;
     var ty = model.GetTypeInfo(e).Type;
     if (ty != null && ty.TypeKind == TypeKind.Enum)
       Refuse(e, "a string made from an enum is not in the Crust C# subset (no `ToString`). Use `(int)value`.");
     switch (ty == null ? SpecialType.None : ty.SpecialType) {
       case SpecialType.System_String:
-        hoisted.Add(t + " += " + Expr(e) + ";");           //Expr yields a named std::string
+        hoisted.Add(t + ".append_str(" + Expr(e) + ");");   //Expr yields a named fastring
         return;
       case SpecialType.System_Boolean:
-        NeedHelper("_cs_app_bool"); hoisted.Add("_cs_app_bool(" + t + ", " + Expr(e) + ");"); return;
+        hoisted.Add(t + ".append_cstr((" + Expr(e) + ") ? \"True\" : \"False\");"); return;
       case SpecialType.System_Byte: case SpecialType.System_SByte: case SpecialType.System_Int16:
       case SpecialType.System_UInt16: case SpecialType.System_Int32: case SpecialType.System_Int64:
-        NeedHelper("_cs_app_ll"); hoisted.Add("_cs_app_ll(" + t + ", (long long)(" + Expr(e) + "));"); return;
+        hoisted.Add(t + ".append_int((long long)(" + Expr(e) + "));"); return;
       case SpecialType.System_UInt32: case SpecialType.System_UInt64:
-        NeedHelper("_cs_app_ull"); hoisted.Add("_cs_app_ull(" + t + ", (unsigned long long)(" + Expr(e) + "));"); return;
+        hoisted.Add(t + ".append_uint((unsigned long long)(" + Expr(e) + "));"); return;
       case SpecialType.System_Single: case SpecialType.System_Double:
         Refuse(e, "a string made from a float / double is not exact in the Crust C# subset: C# prints the shortest round-trip form. Use scaled integers.");
         return;
@@ -1443,24 +1676,7 @@ class CrustEmitter
     Refuse(e, "a string made from `" + (ty == null ? "?" : ty.ToDisplayString()) + "` is not in the Crust C# subset. Use ints, bools and strings.");
   }
 
-  void NeedHelper(string name)
-  {
-    if (!arrayHelpers.Add(name)) return;
-    switch (name) {
-      case "_cs_app_ull":
-        preamble.Append("static void _cs_app_ull(std::string &s, unsigned long long u) { char b[24]; int n = 0; if (u == 0) { b[n] = '0'; n = n + 1; } while (u > 0) { b[n] = (char)('0' + (int)(u % 10)); n = n + 1; u = u / 10; } while (n > 0) { n = n - 1; s.push_back(b[n]); } } ");
-        break;
-      case "_cs_app_ll":
-        NeedHelper("_cs_app_ull");
-        preamble.Append("static void _cs_app_ll(std::string &s, long long v) { if (v < 0) { s.push_back('-'); _cs_app_ull(s, 0ULL - (unsigned long long)v); } else { _cs_app_ull(s, (unsigned long long)v); } } ");
-        break;
-      case "_cs_app_bool":
-        preamble.Append("static void _cs_app_bool(std::string &s, bool v) { if (v) { s.append(\"True\"); } else { s.append(\"False\"); } } ");
-        break;
-    }
-  }
-
-  /** The value of a string expression as a *named* std::string, built into a temporary when it is a composite. */
+  /** The value of a string expression as a *named* fastring, built into a temporary when it is a composite. */
   string StrNamed(ExpressionSyntax e)
   {
     UsesString = true;
@@ -1470,7 +1686,7 @@ class CrustEmitter
     if (inner is ElementAccessExpressionSyntax ea && IsMainArgs(ea.Expression)) {
       RequireHoist(e, "an element of `args`");
       string a = NewTemp("_s");
-      hoisted.Add("std::string " + a + "(" + Expr(ea.Expression) + "[" + Expr(ea.ArgumentList.Arguments[0].Expression) + "]);");
+      hoisted.Add("fastring " + a + " = fastring::from_cstr(" + Expr(ea.Expression) + "[" + Expr(ea.ArgumentList.Arguments[0].Expression) + "]);");
       return a;
     }
     var parts = new List<object>();
@@ -1480,14 +1696,14 @@ class CrustEmitter
     RequireHoist(e, "building this string");
     string t = NewTemp("_s");
     if (concat) {
-      hoisted.Add("std::string " + t + ";");
+      hoisted.Add("fastring " + t + ";");
       var saveRoot = hoistRoot; hoistRoot = inner;
       try { foreach (var part in parts) AppendPart(t, part); } finally { hoistRoot = saveRoot; }
       return t;
     }
     //a call, a property read, string.Empty ...
     if (inner is MemberAccessExpressionSyntax ma0 && model.GetSymbolInfo(ma0).Symbol is IFieldSymbol f0 && f0.ContainingType.SpecialType == SpecialType.System_String) {
-      hoisted.Add("std::string " + t + ";");           //string.Empty
+      hoisted.Add("fastring " + t + ";");           //string.Empty
       return t;
     }
     string call;
@@ -1502,7 +1718,7 @@ class CrustEmitter
         Refuse(e, "this string expression (`" + inner.Kind() + "`) is not in the Crust C# subset.");
         return "";
     }
-    hoisted.Add("std::string " + t + " = " + call + ";");
+    hoisted.Add("fastring " + t + " = " + call + ";");
     return t;
   }
 
@@ -1597,15 +1813,12 @@ class CrustEmitter
     var sym = model.GetSymbolInfo(ma).Symbol;
     var recvType = model.GetTypeInfo(ma.Expression).Type;
 
-    if (recvType != null && recvType.SpecialType == SpecialType.System_String && ma.Name.Identifier.Text == "Length")
-      return Expr(ma.Expression) + ".size()";
-    //arrays and lists
+    //arrays are std::vector: their one property is built in
     if (recvType is IArrayTypeSymbol && ma.Name.Identifier.Text == "Length")
       return Expr(ma.Expression) + ".size()";
-    if (IsList(recvType) && ma.Name.Identifier.Text == "Count")
-      return Expr(ma.Expression) + ".size()";
-    if (IsDictionary(recvType) && ma.Name.Identifier.Text == "Count")
-      return Expr(ma.Expression) + ".size()";
+
+    if (sym is IPropertySymbol lps && IsLib(lps)) return CorelibProperty(ma, lps);
+    if (sym is IFieldSymbol lfs && IsLib(lfs) && lfs.ContainingType.TypeKind != TypeKind.Enum) RefuseUnimplemented(ma, lfs);
 
     if (sym is IPropertySymbol ps) {
       if (ps.IsStatic) return FlatName(ps.ContainingType) + "::get_" + Ident(ps.Name) + "()";
@@ -1651,32 +1864,55 @@ class CrustEmitter
     if (sym.ContainingType != null && sym.ContainingType.ToDisplayString() == "System.Console")
       return ConsoleCall(inv, sym);
 
-    // List<T> / Dictionary<K,V> members
-    var ma = inv.Expression as MemberAccessExpressionSyntax;
-    if (ma != null) {
-      var rt = model.GetTypeInfo(ma.Expression).Type;
-      string n = ma.Name.Identifier.Text;
-      if (IsList(rt)) {
-        string r = Expr(ma.Expression);
-        if (n == "Add" && inv.ArgumentList.Arguments.Count == 1) return r + ".push_back(" + Arg(inv.ArgumentList.Arguments[0]) + ")";
-        if (n == "Clear" && inv.ArgumentList.Arguments.Count == 0) return r + ".clear()";
-        Refuse(inv, "`List<T>." + n + "` is not supported by CC# --crust yet. Available: Add, Clear, Count, the indexer, foreach.");
-      }
-      if (IsDictionary(rt))
-        Refuse(inv, "`Dictionary<K,V>." + n + "` is not supported by CC# --crust yet. Available: Count.");
-      if (rt != null && rt is INamedTypeSymbol nts && nts.ToDisplayString().StartsWith("System."))
-        Refuse(inv, "`" + nts.ToDisplayString() + "." + n + "` is not in the Crust C# subset: the .NET class library is not available.");
-    }
-    if (sym.ContainingType != null && sym.ContainingType.ContainingNamespace != null
-        && sym.ContainingType.ContainingNamespace.ToDisplayString().StartsWith("System")
-        && sym.ContainingType.SpecialType != SpecialType.System_Object)
-      Refuse(inv, "`" + sym.ContainingType.Name + "." + sym.Name + "` is not in the Crust C# subset: the .NET class library is not available.");
+    // the corelib: a [Cpp] template says how the call is spelled; a declaration without one is not implemented
+    string tpl = CppTemplate(sym);
+    if (tpl != null) return CorelibCall(inv, sym, tpl);
+    if (IsLib(sym)) RefuseUnimplemented(inv, sym);
     if (sym.IsGenericMethod)
       Refuse(inv, "generic methods are not in the Crust C# subset.");
 
     string callee = Expr(inv.Expression);
-    var args = inv.ArgumentList.Arguments.Select(a => Arg(a));
+    var args = ArgTexts(inv.ArgumentList.Arguments, inv);
     return callee + "(" + string.Join(", ", args) + ")";
+  }
+
+  /** a call to a corelib member that has a [Cpp] template. */
+  string CorelibCall(InvocationExpressionSyntax inv, IMethodSymbol sym, string tpl)
+  {
+    AddIncludes(sym);
+    if (sym.IsGenericMethod) Refuse(inv, "generic methods are not in the Crust C# subset.");
+    var saveRoot = hoistRoot;
+    if (HasCppAttr(sym, "CppFluentAttribute") && hoistRoot == null) {
+      //the calls of a chain are emitted strictly in order, so what is inside the chain is exempt from the reorder check
+      ExpressionSyntax top = inv;
+      while (top.Parent is MemberAccessExpressionSyntax pm && pm.Expression == top && pm.Parent is InvocationExpressionSyntax pi) top = pi;
+      hoistRoot = top;
+    }
+    try {
+      var ma = inv.Expression as MemberAccessExpressionSyntax;
+      string recv = null;
+      if (!sym.IsStatic) {
+        if (ma == null) Refuse(inv, "`" + sym.Name + "` needs a receiver.");
+        recv = RecvText(ma.Expression);
+      }
+      var args = inv.ArgumentList.Arguments;
+      //only the arguments the template spells as {N} are materialised: `{0:c}` of a literal needs no temporary
+      var plain = new HashSet<int>();
+      foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(tpl, @"\{(\d+)\}"))
+        plain.Add(int.Parse(m.Groups[1].Value));
+      var texts = ArgTexts(args, inv, i => !plain.Contains(i) && model.GetConstantValue(args[i].Expression).HasValue);
+      return Expand(tpl, sym, recv, args, texts, sym.ContainingType.TypeArguments.ToArray(), inv);
+    } finally { hoistRoot = saveRoot; }
+  }
+
+  /** a read of a corelib property that has a [Cpp] template. */
+  string CorelibProperty(MemberAccessExpressionSyntax ma, IPropertySymbol ps)
+  {
+    string tpl = CppTemplate(ps);
+    if (tpl == null) RefuseUnimplemented(ma, ps);
+    AddIncludes(ps);
+    string recv = ps.IsStatic ? null : RecvText(ma.Expression);
+    return Expand(tpl, ps, recv, new List<ArgumentSyntax>(), new string[0], ps.ContainingType.TypeArguments.ToArray(), ma);
   }
 
   // ---- Console.Write / WriteLine -> printf
@@ -1805,7 +2041,7 @@ class CrustEmitter
       if (oc.Initializer != null)
         Refuse(oc.Initializer, "object / collection initializers are not in the Crust C# subset. Assign the fields on the next lines.");
     } else if (e is ImplicitObjectCreationExpressionSyntax ioc) al = ioc.ArgumentList;
-    var args = al == null ? new List<string>() : al.Arguments.Select(a => Arg(a)).ToList();
+    var args = al == null ? new List<string>() : ArgTexts(al.Arguments, e).ToList();
     return TypeName(type, e) + "(" + string.Join(", ", args) + ")";
   }
 
@@ -1859,13 +2095,27 @@ class CrustEmitter
     }
     if ((op == "==" || op == "!=") && lt != null && (IsOwnedClass(lt) || lt.TypeKind == TypeKind.Interface))
       Refuse(b, "`==` on class references is not in the Crust C# subset: a class is a value, there is no identity. Compare a field.");
-    if (op == "<<" || op == ">>") {
-      int bits = BitWidth(model.GetTypeInfo(b).Type);
-      return "(" + Expr(b.Left) + " " + op + " (" + Expr(b.Right) + " & " + (bits - 1) + "))";
-    }
     if (op == ">>>")
       Refuse(b, "`>>>` is not in the Crust C# subset.");
-    return Expr(b.Left) + " " + op + " " + Expr(b.Right);
+    //&& and || sequence their operands in C as in C#; everything else does not
+    string lhs = null;
+    var saveRoot = hoistRoot;
+    try {
+      if (op != "&&" && op != "||" && lt != null && !Borrowed(lt) && lt.TypeKind != TypeKind.Interface && Conflicts(b.Left, b.Right)) {
+        if (!canHoist)
+          Refuse(b, "the operands of `" + op + "` conflict (the right one has a side effect the left one could observe), and C does not say which is evaluated first. Evaluate the left operand into a local on its own line first.");
+        RequireHoist(b, "the operands of `" + op + "`");
+        if (hoistRoot == null || !hoistRoot.Span.Contains(b.Span)) hoistRoot = b;   //what is inside is generated strictly in order
+        lhs = NewTemp("_a");
+        hoisted.Add(TypeName(lt, b) + " " + lhs + " = " + Expr(b.Left) + ";");
+      }
+      string left = lhs ?? Expr(b.Left);
+      if (op == "<<" || op == ">>") {
+        int bits = BitWidth(model.GetTypeInfo(b).Type);
+        return "(" + left + " " + op + " (" + Expr(b.Right) + " & " + (bits - 1) + "))";
+      }
+      return left + " " + op + " " + Expr(b.Right);
+    } finally { hoistRoot = saveRoot; }
   }
 
   int BitWidth(ITypeSymbol t)
@@ -1938,9 +2188,9 @@ class CrustEmitter
       if (!statement) Refuse(a, "assigning a string inside a larger expression is not in the Crust C# subset. Make it a statement.");
       if (op == "+=") {
         var cvr = model.GetConstantValue(a.Right);
-        if (cvr.HasValue && cvr.Value is string lit) return Expr(a.Left) + ".append(\"" + CLit(lit) + "\")";
+        if (cvr.HasValue && cvr.Value is string lit) return Expr(a.Left) + ".append_cstr(\"" + CLit(lit) + "\")";
         var rty = model.GetTypeInfo(a.Right).Type;
-        if (rty != null && rty.SpecialType == SpecialType.System_String) return Expr(a.Left) + " += " + Expr(a.Right);
+        if (rty != null && rty.SpecialType == SpecialType.System_String) return Expr(a.Left) + ".append_str(" + Expr(a.Right) + ")";
         //s += 5  ->  append the digits
         RequireHoist(a.Right, "appending a number to a string");
         string lhs = Expr(a.Left);
@@ -1952,6 +2202,12 @@ class CrustEmitter
     }
     if (op == "=" && lt != null && (IsOwnedClass(lt) || IsList(lt)) && !IsFresh(a.Right))
       Refuse(a, "assigning one object to another would alias it: a class is single-owner here. Construct with `new`, or copy the fields.");
+    if (op != "=" && IsImpure(a.Right) && !(Unparen(a.Left) is IdentifierNameSyntax lid && IsLocalLike(model.GetSymbolInfo(lid).Symbol))) {
+      var wl = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+      Writes(a.Right, wl, out bool wh);
+      if (wh)
+        Refuse(a, "`" + op + "` with a right side that has a side effect: C# reads the left side first, C does not say. Evaluate the right side into a local first.");
+    }
     if (op == "<<=" || op == ">>=") {
       int bits = BitWidth(lt);
       return Expr(a.Left) + " " + op + " (" + Expr(a.Right) + " & " + (bits - 1) + ")";
