@@ -2,12 +2,14 @@
 """run_tests -- every case in crust/tests runs through CC# --crust -> cpprust -> C -> native,
 and its stdout + exit status are compared with the same C# run on real .NET.
 
-    CRUST_HOME=~/crust CCS="dotnet CCSharpCompiler.dll" python3 crust/run_tests.py [name ...]
+    python3 crust/run_tests.py [name ...]            (python3 build.py test sets up the environment)
+    SHIVYC=1 python3 crust/run_tests.py              also compile each case with Crust's own compiler (experimental)
 
 A case is  tests/NAME.cs  (or a folder tests/NAME/ of .cs files).  The first lines may carry:
 
     // refuse: some text     the compile must be REFUSED, and the message must contain the text
     // expect-rc: 3          override the reference exit status (when there is no .NET to ask)
+    // main: Class           the entry point to use when the program has several Main methods
 
 Refusals are tested as pinned behaviour: for this subset a refusal is the deliverable.
 """
@@ -22,12 +24,13 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import ccs2c                                            # noqa: E402
+import inputs as inputs_mod                             # noqa: E402
 
 TESTS = os.path.join(HERE, "tests")
 
 
-def dotnet_reference(src_dir):
-    """Run the case on real .NET.  None if there is no SDK."""
+def dotnet_reference(files, main=None):
+    """Run the case (the list of .cs files) on real .NET.  None if there is no SDK."""
     dotnet = shutil.which("dotnet")
     if not dotnet:
         return None
@@ -38,14 +41,11 @@ def dotnet_reference(src_dir):
     csc, rt = roots[0], shared[0]
     tmp = tempfile.mkdtemp(prefix="ccs-ref-")
     try:
-        files = []
-        for root, _, fs in os.walk(src_dir):
-            files += [os.path.join(root, f) for f in fs if f.endswith(".cs")]
         refs = ["-r:" + os.path.join(rt, n) for n in
                 ("System.Private.CoreLib.dll", "System.Runtime.dll", "System.Console.dll", "System.Collections.dll")]
         exe = os.path.join(tmp, "ref.dll")
         p = subprocess.run([dotnet, csc, "-nologo", "-nowarn:0626,0219,0168,0414,0649,0169", "-unsafe", "-out:" + exe,
-                            "-t:exe", "-noconfig", "-nostdlib"] + refs + sorted(files),
+                            "-t:exe", "-noconfig", "-nostdlib"] + (["-main:" + main] if main else []) + refs + sorted(files),
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if p.returncode != 0:
             return ("compile-error", p.stdout.decode("utf-8", "replace"))
@@ -73,12 +73,15 @@ def cases(names):
 def header(p):
     first = p
     if os.path.isdir(p):
-        fs = sorted(glob.glob(os.path.join(p, "*.cs")))
+        fs = [f for f in sorted(glob.glob(os.path.join(p, "**", "*.cs"), recursive=True))
+              if "/obj/" not in f and "/bin/" not in f]
+        if not fs:
+            return {}
         first = fs[0]
     meta = {}
     with open(first) as f:
         for line in f:
-            m = re.match(r"//\s*(refuse|expect-rc):\s*(.*)$", line)
+            m = re.match(r"//\s*(refuse|expect-rc|main):\s*(.*)$", line)
             if m:
                 meta[m.group(1)] = m.group(2).strip()
             elif line.strip() and not line.startswith("//"):
@@ -86,12 +89,17 @@ def header(p):
     return meta
 
 
-def check_lines(src_dir, cpp_dir):
+def check_lines(files, cpp_dir):
     """Line numbers are preserved: a `return` on C# line N is on (virtual) line N of the emitted C++.
     This is what lets a Crust diagnostic point at the .cs line.  `#line` resyncs a type that was moved."""
     problems = []
-    for cs in sorted(glob.glob(os.path.join(src_dir, "**", "*.cs"), recursive=True)):
-        out = os.path.join(cpp_dir, os.path.basename(cs)[:-3] + ".cpp")
+    root = os.path.dirname(files[0]) if len(files) == 1 else os.path.commonpath(files)
+    if os.path.isfile(root):
+        root = os.path.dirname(root)
+    for cs in files:
+        #the compiler names a file's output by its path under the common folder: dir/Util.cs -> dir_Util.cpp
+        rel = os.path.relpath(cs, root)[:-3].replace(".", "_").replace(os.sep, "_")
+        out = os.path.join(cpp_dir, rel + ".cpp")
         if not os.path.exists(out):
             continue
         virt = {}
@@ -119,28 +127,46 @@ def run_case(name, path):
         tmpdir = tempfile.mkdtemp(prefix="ccs-case-")
         shutil.copy(path, os.path.join(tmpdir, "Case.cs"))
         src = tmpdir
+    #JUNK.txt lists files (bin/, obj/ ...) that must exist and must be ignored; git ignores such folders, so they are made here
+    if os.path.isdir(src) and os.path.exists(os.path.join(src, "JUNK.txt")):
+        for rel in open(os.path.join(src, "JUNK.txt")).read().split():
+            jp = os.path.join(src, *rel.split("/"))
+            if not os.path.exists(jp):
+                os.makedirs(os.path.dirname(jp), exist_ok=True)
+                with open(jp, "w") as jf:
+                    jf.write("this is not C# and must never be compiled {{{\n")
+    #a case folder holding a .sln or .csproj is converted AS that project; otherwise it is the folder
+    inp = [src]
+    if os.path.isdir(src):
+        slns = sorted(glob.glob(os.path.join(src, "*.sln")))
+        projs = sorted(glob.glob(os.path.join(src, "*.csproj")))
+        inp = [slns[0]] if slns else [projs[0]] if projs else [src]
+    try:
+        files = inputs_mod.expand(inp)
+    except inputs_mod.InputError as e:
+        return (False, "inputs: %s" % e)
     try:
         if "refuse" in meta:
             try:
-                cpp, d = ccs2c.to_cpp(src)
+                cpp, d = ccs2c.to_cpp(inp, meta.get("main"))
                 ccs2c.to_c(cpp, d)
             except ccs2c.Refused as e:
                 return (meta["refuse"] in str(e), "refused: " + str(e).splitlines()[-2][:150] if str(e).strip() else str(e))
             except Exception as e:
                 return (meta["refuse"] in str(e), "cpprust refused: " + str(e)[:150])
             return (False, "expected a refusal containing %r, got a translation" % meta["refuse"])
-        ref = dotnet_reference(src)
+        ref = dotnet_reference(files, meta.get("main"))
         try:
-            cpp, d = ccs2c.to_cpp(src)
-            lp = check_lines(src, d)
+            cpp, d = ccs2c.to_cpp(inp, meta.get("main"))
+            lp = check_lines(files, d)
             if lp:
                 return (False, "line numbers moved: " + "; ".join(lp[:3]))
             c = ccs2c.to_c(cpp, d)
             rc, out = ccs2c.build_run(c)
             note = ""
-            if os.environ.get("NO_SHIVYC") != "1":
+            if os.environ.get("SHIVYC") == "1":               # opt-in: Crust's own compiler must agree with gcc
                 try:
-                    src_rc, src_out = ccs2c.build_run_shivyc(c)   # Crust's own compiler must agree with gcc
+                    src_rc, src_out = ccs2c.build_run_shivyc(c)
                     if (src_rc & 0xFF, src_out) != (rc & 0xFF, out):
                         return (False, "shivyc and gcc disagree: shivyc rc=%s out=%r, gcc rc=%s out=%r"
                                 % (src_rc & 0xFF, src_out[:200], rc & 0xFF, out[:200]))

@@ -111,7 +111,11 @@ def assemble(program, outdir, name="unit"):
     text += "".join('#include "%s"\n' % os.path.join(cb.ROOT, s) for s in sources)
     text += '#include "%s"\n' % os.path.abspath(program)
     path = os.path.join(outdir, name + ".cc")
-    if not os.path.exists(path) or open(path).read() != text:
+    current = None
+    if os.path.exists(path):
+        with open(path) as f:
+            current = f.read()
+    if current != text:
         with open(path, "w") as f:
             f.write(text)
     return path, files

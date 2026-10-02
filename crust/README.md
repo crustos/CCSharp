@@ -1,9 +1,10 @@
 # CC# `--crust`: the Crust back end
 
 CC# turns C# into the **C++ subset that [Crust](https://github.com/brentharts/crust) accepts**. `cpprust` lowers
-that to C, and gcc or Crust's own `shivyc` compiles it. It is the default back end (`--gc` selects the old one).
-Crust and [coost](https://github.com/crustos/coost) are required; `python3 build.py` (top level) clones them
-beside this repo and builds everything offline.
+that to C, and gcc (the default) or Crust's own `shivyc` (experimental, opt-in) compiles it. Crust and
+[coost](https://github.com/crustos/coost) are required; `python3 build.py` (top level) clones them beside this repo
+and builds everything offline. **The top-level `README.md` is the user guide** (`build.py`, inputs, options); this
+file is about the pipeline and the language mapping.
 
 ```
 C#  --Roslyn-->  Crust C++ subset  --cpprust-->  C  --shivyc / cc-->  native
@@ -11,21 +12,28 @@ C#  --Roslyn-->  Crust C++ subset  --cpprust-->  C  --shivyc / cc-->  native
 ```
 
 ```sh
-python3 build.py                       # everything
-python3 build.py test                  # every case in crust/tests vs real .NET
-python3 build.py run examples/example1/src
-python3 crust/ccs2c.py SRC --exe out [--shivyc]      # the pipeline directly; see its --help
-CCSharpCompiler SRC Project [--home=REPO] [--main=Class]     # writes cpp/*.cpp and cpp/Project.cpp
+python3 build.py                                      # everything
+python3 build.py test                                 # every case in crust/tests vs real .NET (gcc)
+python3 build.py run App.csproj -- arg1 arg2          # files, folders, .csproj, .sln: any number, one program
+python3 crust/ccs2c.py INPUT.. --exe out [--shivyc]   # the pipeline directly; see its --help
+CCSharpCompiler FIRST.cs Name --srclist=FILES.txt --home=REPO [--main=Class]   # what ccs2c runs
 ```
+
+The compiler takes the program as `--srclist=FILE` (one `.cs` path per line); `ccs2c.py` / `build.py` write that list
+from whatever you pass (see `inputs.py`). With no list, `CCSharpCompiler DIR Name` reads every `.cs` under `DIR`.
+It writes `cpp/*.cpp` (one per C# file, named by its path under the common folder, `dir/Util.cs` -> `dir_Util.cpp`)
+and `cpp/Name.main.cpp`, which includes them in dependency order and defines `main`.
 
 ## The files here
 
 | file | what |
 |------|------|
-| `ccs2c.py` | the pipeline: compiler -> unit -> cpprust -> gcc or shivyc, and the `to_cpp` / `to_c` / `build_run` API |
+| `ccs2c.py` | the pipeline: inputs -> compiler -> unit -> cpprust -> gcc (or shivyc), and the `to_cpp` / `to_c` / `build_run` / `convert` API |
+| `inputs.py` | what a program is made of: files, folders, `.csproj` (default items, `Compile Include/Remove`, `ProjectReference`), `.sln` |
+| `test_inputs.py` | unit tests for `inputs.py`, and for converting several inputs as one program |
 | `unit.py` | assembles a program's translation unit: the coost sources its headers reach are spliced in beside it (the rule coost's own build.py uses), then lowered in-process with cpprust's `any_order` (C# lets a type use one declared below it) |
-| `run_tests.py` | the test runner |
-| `tests/` | `NAME.cs` (or a folder) per case; `refuse_*.cs` pin a refusal; `// refuse: text` / `// expect-rc: N` headers |
+| `run_tests.py` | the test runner (gcc; `SHIVYC=1` adds shivyc) |
+| `tests/` | `NAME.cs` (or a folder, or a folder with a `.sln` / `.csproj`) per case; `refuse_*.cs` pin a refusal; `// refuse: text`, `// expect-rc: N`, `// main: Class` headers |
 
 ## What a program means
 
@@ -96,5 +104,5 @@ the statement could observe the reordering; otherwise it is refused, never reord
   also unlock `null` and reference identity); nested types; operator overloading; `char`; string `Split` / `Join`
   / `Format`; `Dictionary<string, ..>` (Crust orders map keys with a `compare` method fastring does not have).
 * A string field is the empty string until assigned (C# has `null`).
-* coost's `fs` and `time` need `<errno.h>`, which shivyc does not bundle: programs using `File` / `Stopwatch` are
-  compiled by gcc only, and the test run says so.
+* shivyc: coost's `fs` and `time` need `<errno.h>`, which it does not bundle, so programs using `File` /
+  `Stopwatch` cannot be compiled by it (`test --shivyc` reports them as `gcc only`). Everything else agrees with gcc.
