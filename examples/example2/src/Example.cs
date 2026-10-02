@@ -1,24 +1,32 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 
+/*
+  A small benchmark in the style of the original CC# example, on the Crust corelib:
+  a growing List<string> scanned on every insert.  Strings are coost fastrings held by value.
+*/
 public class Example {
-  public static int Count = 1024;
+  public static int Count = 64;
+
   public static int Main(String[] args) {
     String s1 = "--";
     String s2 = "++";
-    long start = DateTime.CurrentTimeEpoch();
-    Array<String> al = new Array<String>();
-    for(int x=0;x<Count*32;x++) {
+    Stopwatch sw = Stopwatch.StartNew();
+    List<String> al = new List<String>();
+    int hits = 0;
+    for (int x = 0; x < Count * 32; x++) {
       al.Add(s1);
-      int cnt = al.Size();
-      for(int y=0;y<cnt;y++) {
-        String e = al.Get(y);
-        if (e.Equals(s2)) {
-          Console.Out.WriteLine("ok");
+      int cnt = al.Count;
+      for (int y = 0; y < cnt; y++) {
+        if (al[y].Equals(s2)) {
+          hits++;
         }
       }
     }
-    long stop = DateTime.CurrentTimeEpoch();
-    Console.Out.WriteLine("test4=" + (stop - start));
-    return 0;
+    Console.WriteLine("entries=" + al.Count);
+    Console.WriteLine("hits=" + hits);
+    Console.WriteLine("test4=" + sw.ElapsedMilliseconds + "ms");
+    return hits;
   }
 }
