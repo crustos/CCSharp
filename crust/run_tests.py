@@ -35,10 +35,13 @@ def dotnet_reference(files, main=None):
     if not dotnet:
         return None
     roots = glob.glob("/usr/lib/dotnet/sdk/*/Roslyn/bincore/csc.dll") + glob.glob("/usr/share/dotnet/sdk/*/Roslyn/bincore/csc.dll")
-    shared = (glob.glob("/usr/lib/dotnet/shared/Microsoft.NETCore.App/8.*") + glob.glob("/usr/share/dotnet/shared/Microsoft.NETCore.App/8.*"))
+    # Any installed runtime will do as the reference (the newest one): a machine with only .NET 10 used to get "no .NET reference".
+    def _ver(path):
+        return [int(x) if x.isdigit() else 0 for x in re.split(r"[.-]", os.path.basename(path))]
+    shared = sorted(glob.glob("/usr/lib/dotnet/shared/Microsoft.NETCore.App/*") + glob.glob("/usr/share/dotnet/shared/Microsoft.NETCore.App/*"), key=_ver)
     if not roots or not shared:
         return None
-    csc, rt = roots[0], shared[0]
+    csc, rt = sorted(roots, key=lambda r: _ver(os.path.dirname(os.path.dirname(os.path.dirname(r)))))[-1], shared[-1]
     tmp = tempfile.mkdtemp(prefix="ccs-ref-")
     try:
         refs = ["-r:" + os.path.join(rt, n) for n in
@@ -50,8 +53,8 @@ def dotnet_reference(files, main=None):
         if p.returncode != 0:
             return ("compile-error", p.stdout.decode("utf-8", "replace"))
         with open(os.path.join(tmp, "ref.runtimeconfig.json"), "w") as f:
-            f.write('{"runtimeOptions":{"tfm":"net8.0","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}'
-                    % os.path.basename(rt))
+            f.write('{"runtimeOptions":{"tfm":"net%d.0","framework":{"name":"Microsoft.NETCore.App","version":"%s"}}}'
+                    % (int(os.path.basename(rt).split(".")[0]), os.path.basename(rt)))
         r = subprocess.run([dotnet, exe], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         return (r.returncode & 0xFF, r.stdout.decode("utf-8", "replace").replace("\r\n", "\n"))
     finally:
