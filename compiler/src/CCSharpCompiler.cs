@@ -509,7 +509,7 @@ namespace CCSharpCompiler;
     static string FileView(List<CrustEmitter.CppPiece> pieces)
     {
       var sb = new StringBuilder();
-      foreach (var p in pieces) {
+      foreach (var p in pieces.Where(x => !x.IsHelper)) {
         string t = p.Text.TrimStart('\n');
         int lead = p.Text.Length - t.Length;
         if (lead > 0 || sb.Length > 0) sb.Append("#line ").Append(lead + 1).Append('\n');      //(a piece at the top of the file needs none)
@@ -557,6 +557,9 @@ namespace CCSharpCompiler;
       foreach (var p in pieces) {
         var set = new List<CrustEmitter.CppPiece>();
         void Add(CrustEmitter.CppPiece x) { if (x != null && x != p && !set.Contains(x)) set.Add(x); }
+        foreach (var h in p.Helpers) Add(h);                                                       // a helper it calls
+        foreach (var ty in p.NeedTypes) foreach (var x in Named(ty)) Add(x);                      // (a helper) the types it is written for
+        if (p.Decl == null) { needs[p] = set; continue; }
         foreach (var n in p.Decl.DescendantNodes().OfType<SimpleNameSyntax>()) {
           var sym = p.Model.GetSymbolInfo(n).Symbol;
           if (sym == null) continue;
@@ -609,6 +612,10 @@ namespace CCSharpCompiler;
         File.WriteAllText("/tmp/ccs_order.log", string.Join("\n", order.Select((p, i) => i + " " + p.Name + (order.IndexOf(p) != pieces.IndexOf(p) ? "   (was " + pieces.IndexOf(p) + ")" : ""))) + "\n");
       return order;
     }
+
+    /** The program is parsed with CRUST defined, as csrust and cs2cpp do: a library keeps what the subset cannot take (a debug ToString, a LINQ
+        dump) behind `#if !CRUST`.  The managed half of a --dna build is parsed without it: that code runs on a full runtime. */
+    static readonly CSharpParseOptions CrustParse = CSharpParseOptions.Default.WithPreprocessorSymbols("CRUST");
 
     List<Source> CrustOrder(List<Source> list)
     {
@@ -684,7 +691,7 @@ namespace CCSharpCompiler;
       node.clss = new List<Class>();
       ninja_cpp.Append("build obj/" + baseFile + ext_obj + " : cpp " + node.cppFile + "\r\n");
       ninja_target.Append(" obj/" + baseFile + ext_obj);
-      node.tree = CSharpSyntaxTree.ParseText(node.src);
+      node.tree = CSharpSyntaxTree.ParseText(node.src, CrustParse);
       compiler = compiler.AddSyntaxTrees(node.tree);
       files.Add(node);
     }

@@ -132,7 +132,14 @@ class CrustEmitter
     public MemberDeclarationSyntax Decl;
     public SemanticModel Model;
     public int FirstLine;                        //the source line it starts on
+    public bool IsHelper;                        //a helper function a [Cpp(Helper=..)] member needs (no source of its own)
+    public List<ITypeSymbol> NeedTypes = new List<ITypeSymbol>();     //(a helper) the types it is written for: it comes after them
+    public List<CppPiece> Helpers = new List<CppPiece>();             //the helpers this piece calls: they come before it
   }
+
+  Dictionary<string, CppPiece> helperPieces = new Dictionary<string, CppPiece>();     //one for each distinct helper text in the program
+  List<CppPiece> newHelperPieces = new List<CppPiece>();                              //made while emitting the file in hand
+  HashSet<CppPiece> currentHelpers = new HashSet<CppPiece>();                         //called by the piece in hand
 
   /** Emit one source file, a piece for each type in it (in the order they should come, within the file).  null when the file was refused.
       The types are separate pieces so that the aggregate can order them across files: see Program.OrderPieces. */
@@ -147,15 +154,18 @@ class CrustEmitter
     CollectTypes(root.Members, decls);
     var pieces = new List<CppPiece>();
     string stem = Path.GetFileNameWithoutExtension(file.cppFile);
+    newHelperPieces.Clear();
     foreach (var d in DependencyOrder(decls)) {
       o = new CrustOut();                                   //(its own line count: a piece starts at its own source line)
+      currentHelpers = new HashSet<CppPiece>();
       TopLevel(d);
       string text = o.ToString();
       if (text.Trim().Length == 0) continue;                //(an attribute class is dropped, a foreign type is not emitted)
       var sym = model.GetDeclaredSymbol(d) as INamedTypeSymbol;
-      pieces.Add(new CppPiece { Name = stem + "." + (sym != null ? sym.Name : pieces.Count.ToString()), Text = text, Sym = sym, Decl = d, Model = model, FirstLine = LineOf(d) });
+      pieces.Add(new CppPiece { Name = stem + "." + (sym != null ? sym.Name : pieces.Count.ToString()), Text = text, Sym = sym, Decl = d, Model = model, FirstLine = LineOf(d), Helpers = currentHelpers.ToList() });
     }
     if (errors.Count > before) return null;
+    pieces.AddRange(newHelperPieces);
     return pieces;
   }
 
@@ -911,6 +921,8 @@ class CrustEmitter
         sb.Append(recvText);
       } else if (tok.Length > 0 && tok[0] == 'T' && int.TryParse(tok.Substring(1), out int ti)) {
         sb.Append(TypeName(typeArgs[ti], at));
+      } else if (tok.Length > 0 && tok[0] == 'M' && int.TryParse(tok.Substring(1), out int mi)) {
+        sb.Append(Mangle(TypeName(typeArgs[mi], at)));
       } else {
         bool cstr = tok.EndsWith(":c");
         string num = cstr ? tok.Substring(0, tok.Length - 2) : tok;
@@ -1333,10 +1345,7 @@ class CrustEmitter
     }
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, init).ToList();
     if (IsArena(type)) return t + " " + name + " = new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";
-    if (CppTemplate(type) != null) {
-      if (args.Count > 0) Refuse(init, "`new " + type.Name + "(..)` with arguments is not in the Crust C# subset. Construct it empty and fill it.");
-      return t + " " + name;
-    }
+    if (CppTemplate(type) != null) return t + " " + name + CollectionCtor(type, al, init, args);
     if (args.Count == 0) return t + " " + name;
     return t + " " + name + "(" + string.Join(", ", args) + ")";
   }
@@ -1935,6 +1944,9 @@ class CrustEmitter
   }
   static string Flt(float f)
   {
+    if (float.IsNaN(f)) return "(0.0f / 0.0f)";
+    if (float.IsPositiveInfinity(f)) return "(1.0f / 0.0f)";
+    if (float.IsNegativeInfinity(f)) return "(-1.0f / 0.0f)";
     string s = f.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
     if (s.IndexOf('.') < 0 && s.IndexOf('E') < 0) s += ".0";
     return s + "f";
@@ -2040,10 +2052,32 @@ class CrustEmitter
     return n;
   }
 
+  /** A [Cpp(Helper = "..")] member needs a C++ function: written once for each type it is used with ({T0} is the type, {M0} the type as part of a name), as a
+      piece of its own.  It is not in the preamble, which comes before any type of the program, because a helper that copies an element needs the element
+      complete: the ordering puts it after the types it is written for, and before what calls it. */
+  void UseHelper(string text, ITypeSymbol[] typeArgs, SyntaxNode at)
+  {
+    for (int i = 0; i < typeArgs.Length; i++) {
+      string tn = TypeName(typeArgs[i], at);
+      text = text.Replace("{T" + i + "}", tn).Replace("{M" + i + "}", Mangle(tn));
+    }
+    if (!helperPieces.TryGetValue(text, out var piece)) {
+      piece = new CppPiece { Name = "helper." + helperPieces.Count + "_" + Mangle(text).Substring(0, Math.Min(24, Mangle(text).Length)), Text = text + "\n", IsHelper = true, Model = model };
+      piece.NeedTypes.AddRange(typeArgs);
+      helperPieces[text] = piece;
+      newHelperPieces.Add(piece);
+    }
+    currentHelpers.Add(piece);
+  }
+
   /** a call to a corelib member that has a [Cpp] template. */
   string CorelibCall(InvocationExpressionSyntax inv, IMethodSymbol sym, string tpl)
   {
     AddIncludes(sym);
+    foreach (var a in sym.OriginalDefinition.GetAttributes())
+      if (a.AttributeClass != null && a.AttributeClass.Name == "CppAttribute")
+        foreach (var na in a.NamedArguments)
+          if (na.Key == "Helper" && na.Value.Value is string helperText) UseHelper(helperText, sym.ContainingType.TypeArguments.ToArray(), inv);
     if (sym.IsGenericMethod) Refuse(inv, "generic methods are not in the Crust C# subset.");
     var saveRoot = hoistRoot;
     if (HasCppAttr(sym, "CppFluentAttribute") && hoistRoot == null) {
@@ -2213,7 +2247,36 @@ class CrustEmitter
     } else if (e is ImplicitObjectCreationExpressionSyntax ioc) al = ioc.ArgumentList;
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, e).ToList();
     if (IsArena(type)) return "new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";     //cpprust: T__alloc(..)
+    if (CppTemplate(type) != null) return TypeName(type, e) + (CollectionCtor(type, al, e, args) is string c && c.Length > 0 ? c : "()");
     return TypeName(type, e) + "(" + string.Join(", ", args) + ")";
+  }
+
+  /** What follows the name in `new List<T>(..)`: nothing for an empty list, `(other)` for a copy.  A C++ `vector<T> v(n)` is n elements and a C# `new List<T>(n)`
+      is an empty list with room for n, so the arguments are not passed on as they are:
+        * an int is a capacity, a hint that changes nothing a program can see: the list is built empty (the int must have no side effect, which would be lost);
+        * a List<T> is a copy of the elements, which is what C# does too when they are values (numbers, structs, enums, strings) or arena references; for an
+          owned class C# would share the objects and a copy would not, so it is refused.
+      Anything else is refused. */
+  string CollectionCtor(ITypeSymbol type, ArgumentListSyntax al, SyntaxNode at, List<string> args)
+  {
+    if (args.Count == 0) return "";
+    string def = type.OriginalDefinition.ToDisplayString();
+    if (def != "System.Collections.Generic.List<T>" || args.Count != 1)
+      Refuse(at, "`new " + type.Name + "(..)` with these arguments is not in the Crust C# subset. Construct it empty and fill it.");
+    var arg = al.Arguments[0].Expression;
+    var at2 = model.GetTypeInfo(arg).Type;
+    if (at2 != null && at2.SpecialType == SpecialType.System_Int32) {
+      if (!IsPure(arg)) Refuse(arg, "the capacity of a list is only a hint and is not used here, but `" + arg + "` has a side effect that would be lost. Assign it to a local first.");
+      return "";
+    }
+    if (at2 != null && at2.OriginalDefinition.ToDisplayString() == "System.Collections.Generic.List<T>") {
+      var elem = ((INamedTypeSymbol)type).TypeArguments[0];
+      if (IsOwnedClass(elem))
+        Refuse(arg, "`new List<" + elem.Name + ">(list)` copies the elements here, and C# would share the objects: " + elem.Name + " is a class owned by its list in Crust. Add them in a loop, or make it an arena class.");
+      return "(" + args[0] + ")";
+    }
+    Refuse(arg, "`new " + type.Name + "(..)` takes a capacity (an int) or another List<T> here. Construct it empty and fill it.");
+    return "";
   }
 
   string NewArray(ArrayCreationExpressionSyntax ac)
@@ -2344,6 +2407,24 @@ class CrustEmitter
     return ps != null && !ps.IsIndexer ? ps : null;   //xs[i] on a List<T> is an indexer, not a get_/set_ pair
   }
 
+  /** `list.Capacity = n`: a corelib property is assigned through its [CppSet] template, or not at all. */
+  string CorelibPropertySet(AssignmentExpressionSyntax a, IPropertySymbol ps, string op)
+  {
+    string tpl = null;
+    foreach (var at in ps.OriginalDefinition.GetAttributes())
+      if (at.AttributeClass != null && at.AttributeClass.Name == "CppSetAttribute" && at.ConstructorArguments.Length == 1) tpl = at.ConstructorArguments[0].Value as string;
+    if (tpl == null) RefuseUnimplemented(a.Left, ps);
+    if (op != "=") Refuse(a, "`" + op + "` on `" + ps.Name + "` is not in the Crust C# subset. Assign it with `=`.");
+    AddIncludes(ps);
+    string recv = null;
+    if (!ps.IsStatic) {
+      if (!(a.Left is MemberAccessExpressionSyntax ma)) { Refuse(a, "`" + ps.Name + "` needs a receiver."); return ""; }
+      recv = RecvText(ma.Expression);
+    }
+    var args = new List<ArgumentSyntax> { SyntaxFactory.Argument(a.Right) };
+    return Expand(tpl, ps, recv, args, new[] { Expr(a.Right) }, ps.ContainingType.TypeArguments.ToArray(), a);
+  }
+
   string PropRecv(ExpressionSyntax e, IPropertySymbol ps)
   {
     if (ps.IsStatic) return FlatName(ps.ContainingType) + "::";
@@ -2364,6 +2445,7 @@ class CrustEmitter
     var prop = PropertyTarget(a.Left);
     if (prop != null) {
       if (!statement) Refuse(a, "assigning a property inside a larger expression is not in the Crust C# subset. Make it a statement.");
+      if (IsLib(prop)) return CorelibPropertySet(a, prop, op);
       if (op == "=") return PropSet(a.Left, prop, Expr(a.Right));
       string bop = op.Substring(0, op.Length - 1);
       return PropSet(a.Left, prop, PropGet(a.Left, prop) + " " + bop + " " + Expr(a.Right));
