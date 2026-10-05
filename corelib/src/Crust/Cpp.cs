@@ -36,4 +36,24 @@ namespace Crust {
   [System.AttributeUsage(System.AttributeTargets.Method)]
   public sealed class CppFluentAttribute : System.Attribute {
   }
+
+  /** An arena class: `[MaxInstances(N)] class T`.  C#'s reference semantics without a GC: the class has N statically allocated slots, a reference
+      is a plain pointer (assignment copies it, null is 0, == compares references), and `new T(..)` takes the next slot.  The (N+1)th live object
+      aborts.  The attribute is found by name, so a program may declare its own marker class instead. */
+  [System.AttributeUsage(System.AttributeTargets.Class, AllowMultiple = false)]
+  public sealed class MaxInstancesAttribute : System.Attribute {
+    public MaxInstancesAttribute(int n) {}
+  }
+
+  /** (--dna) The class runs on the managed side: Crust does not lower it, and DotNetAnywhere interprets its CIL.
+      It overrides the default, which is to try Crust first and fall back to managed when the class is refused. */
+  [System.AttributeUsage(System.AttributeTargets.Class | System.AttributeTargets.Struct | System.AttributeTargets.Interface, AllowMultiple = false)]
+  public sealed class ManagedAttribute : System.Attribute {
+  }
+
+  /** (--dna) The class must be lowered to Crust C++.  If it is outside the Crust subset that is an error, as without --dna,
+      and never a silent fall back to managed.  It overrides the default. */
+  [System.AttributeUsage(System.AttributeTargets.Class | System.AttributeTargets.Struct | System.AttributeTargets.Interface, AllowMultiple = false)]
+  public sealed class NativeAttribute : System.Attribute {
+  }
 }
