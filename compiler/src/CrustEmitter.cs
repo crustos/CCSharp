@@ -77,11 +77,15 @@ class CrustEmitter
 
   public List<string> errors = new List<string>();
 
+  public PartitionPlan plan;                     //--dna: which classes are native and which managed (null: every class is native, or refused)
+  public bool probing;                           //--dna, first pass: emit to find what each class is refused for; the output is discarded
+
   Source src;
   IMethodSymbol currentMethod;                   //the method whose body is being emitted
   INamedTypeSymbol currentType;                  //the class whose members are being emitted
   SemanticModel model;
   CrustOut o;
+
   string mainClass;                              //--main=Class (flat name) or null
   public static string entryCall;                //"Cls::Main" once found
   public static bool entryReturnsInt;
@@ -119,23 +123,44 @@ class CrustEmitter
 
   // ------------------------------------------------------------------ entry points
 
-  /** Emit one source file.  Returns the C++ text, or null when the file was refused. */
-  public string EmitFile(Source file)
+  /** One top-level type's C++, with what the aggregate needs to order it. */
+  public class CppPiece
+  {
+    public string Name;                          //a file name for it (without .cpp)
+    public string Text;
+    public INamedTypeSymbol Sym;
+    public MemberDeclarationSyntax Decl;
+    public SemanticModel Model;
+    public int FirstLine;                        //the source line it starts on
+  }
+
+  /** Emit one source file, a piece for each type in it (in the order they should come, within the file).  null when the file was refused.
+      The types are separate pieces so that the aggregate can order them across files: see Program.OrderPieces. */
+  public List<CppPiece> EmitFile(Source file)
   {
     src = file;
     model = file.model;
-    o = new CrustOut();
     preambleDone = false;
-    firstOutput = true;
-    preamble.Clear();
     int before = errors.Count;
     var root = (CompilationUnitSyntax)file.tree.GetRoot();
     var decls = new List<MemberDeclarationSyntax>();
     CollectTypes(root.Members, decls);
-    foreach (var d in DependencyOrder(decls)) TopLevel(d);
+    var pieces = new List<CppPiece>();
+    string stem = Path.GetFileNameWithoutExtension(file.cppFile);
+    foreach (var d in DependencyOrder(decls)) {
+      o = new CrustOut();                                   //(its own line count: a piece starts at its own source line)
+      TopLevel(d);
+      string text = o.ToString();
+      if (text.Trim().Length == 0) continue;                //(an attribute class is dropped, a foreign type is not emitted)
+      var sym = model.GetDeclaredSymbol(d) as INamedTypeSymbol;
+      pieces.Add(new CppPiece { Name = stem + "." + (sym != null ? sym.Name : pieces.Count.ToString()), Text = text, Sym = sym, Decl = d, Model = model, FirstLine = LineOf(d) });
+    }
     if (errors.Count > before) return null;
-    return FinishPreamble(o.ToString());
+    return pieces;
   }
+
+  /** What every file needs at the top of the program: the wrapv pragma, and the helpers the code used. */
+  public string Preamble { get { return WRAPV_PRAGMA + preamble.ToString(); } }
 
   public string EmitMain()
   {
@@ -226,9 +251,12 @@ class CrustEmitter
           foreach (var m in fs.Members) TopLevel(m);
           break;
         case EnumDeclarationSyntax e: Enum(e); break;
-        case ClassDeclarationSyntax c: Class(c, "class"); break;
-        case StructDeclarationSyntax s: Class(s, "class"); break;
-        case InterfaceDeclarationSyntax i: Class(i, "class"); break;
+        case ClassDeclarationSyntax c: ClassPart(c); break;
+        case StructDeclarationSyntax s: ClassPart(s); break;
+        case InterfaceDeclarationSyntax i: ClassPart(i); break;
+        case DelegateDeclarationSyntax _ when plan != null: break;       //--dna: managed only, see PartitionPlan.Decide
+        case GlobalStatementSyntax _ when plan != null: break;           //--dna: the managed side's entry point
+        case RecordDeclarationSyntax _ when plan != null: break;         //--dna: managed only
         case DelegateDeclarationSyntax dg:
           Refuse(dg, "`delegate` is not in the Crust C# subset: delegates need a captured-state representation. Use a static method, or an interface with one method.");
           break;
@@ -259,6 +287,9 @@ class CrustEmitter
     if (reserved.Contains(name)) return name + "_";
     return name;
   }
+
+  /** `Ident`, for the bridge (Bridge.cs), which spells names as Crust does without an emitter at hand. */
+  internal static string IdentOf(string name) { return reserved.Contains(name) ? name + "_" : name; }
 
   string Underlying(INamedTypeSymbol e)
   {
@@ -296,16 +327,25 @@ class CrustEmitter
   }
 
   /** helpers + wrapv pragma ride on the first line of output. */
-  void FirstLinePrefix(StringBuilder sb)
-  {
-    if (firstOutput) {
-      firstOutput = false;
-      sb.Insert(0, WRAPV_PRAGMA + "_CS_PREAMBLE_ ");
-    }
-  }
-  bool firstOutput = true;
+  void FirstLinePrefix(StringBuilder sb) { }       //(the wrapv pragma and the helpers are at the top of the program: Preamble)
 
   bool IsOwnedTypeDecl(TypeDeclarationSyntax t) { return true; }
+
+  /** --dna: a class goes native or managed as the plan says.  The probe pass emits everything, and records for each class what
+      it was refused for (it never reports: a refusal is how a class becomes managed).  The real pass skips the managed classes. */
+  void ClassPart(TypeDeclarationSyntax c)
+  {
+    if (plan == null) { Class(c, "class"); return; }
+    var cp = plan.Get(model.GetDeclaredSymbol(c));
+    if (probing) {
+      int before = errors.Count;
+      try { Class(c, "class"); } catch (CrustRefusal r) { Report(r); }
+      if (cp != null) for (int i = before; i < errors.Count; i++) cp.Refusals.Add(errors[i]);
+      return;
+    }
+    if (cp != null && cp.Final == Part.Managed) return;
+    Class(c, "class");
+  }
 
   void Class(TypeDeclarationSyntax c, string kw)
   {
@@ -320,6 +360,8 @@ class CrustEmitter
       Refuse(c, "`unsafe` is not in the Crust C# subset.");
     //attribute classes are markers the C# compiler needs; Crust drops them
     if (sym.BaseType != null && sym.BaseType.ToDisplayString() == "System.Attribute") return;
+    //a type that names a C type (`[Crust.Cpp("PB2Body")] struct PB2Body { .. }`) is that type, declared by the header it includes: nothing to emit
+    if (CppTemplate(sym) != null) return;
 
     Begin(LineOf(c));
     var head = new StringBuilder();
@@ -343,6 +385,15 @@ class CrustEmitter
     if (bases.Count > 0) head.Append(" : " + string.Join(", ", bases));
     head.Append(" {");
     var sbh = new StringBuilder(head.ToString());
+    int arena = ArenaSize(sym);
+    if (arena > 0) {
+      //capacity for cpprust, and `new T[n]`: n null references (a helper here rather than at the top of the file, where T is not yet a complete type)
+      string flat = FlatName(sym);
+      ArenaClasses.Add(flat);
+      sbh.Append(" static const int __max_instances = " + arena + ";"
+        + " static std::vector<" + flat + " *> __new_array(int n) { std::vector<" + flat + " *> v; int i = 0; if (n < 0) { abort(); }"
+        + " while (i < n) { v.push_back(0); i = i + 1; } return v; }");
+    }
     FirstLinePrefix(sbh);
     o.Text(sbh.ToString());
 
@@ -364,9 +415,22 @@ class CrustEmitter
         string n = a.Name.ToString();
         if (n == "Shared" || n == "SharedAttribute")
           Refuse(a, "`[Shared]` (shared_ptr classes) is not supported by CC# --crust yet. Default single-owner classes are.");
-        if (n == "MaxInstances" || n == "MaxInstancesAttribute")
-          Refuse(a, "`[MaxInstances(N)]` (arena classes) is not supported by CC# --crust yet.");
+        if (n == "MaxInstances" || n == "MaxInstancesAttribute") {
+          if (!(c is ClassDeclarationSyntax))
+            Refuse(a, "`[MaxInstances(N)]` is for a class: a struct is a value and an interface has no instances.");
+          if (ArenaSize(sym) <= 0)
+            Refuse(a, "`[MaxInstances(N)]` needs a constant N greater than 0.");
+          if (c.TypeParameterList != null)
+            Refuse(a, "an arena class cannot be generic: each instantiation would need an arena of its own. Make the arena class concrete.");
+          if (c.BaseList != null && c.BaseList.Types.Count > 0)
+            Refuse(c.BaseList, "an arena class with a base class or an interface is not supported by CC# --crust yet.");
+          if (c.Modifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword)))
+            Refuse(a, "an arena class cannot be static: it has instances.");
+        }
       }
+    //a class that derives from an arena class would need its own slots and a layout that begins with its base's
+    if (sym.BaseType != null && IsArena(sym.BaseType) && !IsArena(sym))
+      Refuse(c, "`" + sym.Name + "` derives from the arena class `" + sym.BaseType.Name + "`: inheriting from an arena class is not supported by CC# --crust yet.");
   }
 
   void Member(MemberDeclarationSyntax m, INamedTypeSymbol owner, bool isInterface)
@@ -419,6 +483,7 @@ class CrustEmitter
         return "0";
     }
     if (t.TypeKind == TypeKind.Enum) return "0";
+    if (IsArena(t)) return "NULL";                       //a reference that refers to nothing
     return null;   //aggregates: default-constructed (C# would have null for a class: see Refuse in TypeName)
   }
 
@@ -461,7 +526,49 @@ class CrustEmitter
   bool IsOwnedClass(ITypeSymbol t)
   {
     return t.TypeKind == TypeKind.Class && t.SpecialType == SpecialType.None
-           && !(t is IArrayTypeSymbol) && !IsList(t) && !IsDictionary(t);
+           && !(t is IArrayTypeSymbol) && !IsList(t) && !IsDictionary(t) && !IsArena(t);
+  }
+
+  // ---- arena classes: `[MaxInstances(N)] class T`
+  //
+  // C#'s reference semantics without a GC: the class has N statically allocated slots, and a reference to it is a plain `T *`.  Assignment copies
+  // the pointer, `null` is 0, `==` compares pointers, a reference may be stored in a field, a List<T> or a T[] and passed and returned freely.
+  // `new T(..)` takes the next slot, zeroed, and runs the constructor (cpprust's `T__alloc`); nothing is freed one at a time, and an (N+1)th live
+  // object aborts.  Crust's side of this is `static const int __max_instances = N;` in the class (CPPRUST.md, "Arena classes").
+  // An arena class has no base class, interface or type parameter: a pointer to it is then the address of the object, whatever it is cast to.
+
+  Dictionary<INamedTypeSymbol, int> arenaSizes = new Dictionary<INamedTypeSymbol, int>(SymbolEqualityComparer.Default);
+  public SortedSet<string> ArenaClasses = new SortedSet<string>(StringComparer.Ordinal);   //the arena classes named so far: the aggregate declares them first
+
+  /** N of `[MaxInstances(N)]`, else 0.  The attribute is found by name, as `[Shared]` is: a program may declare its own marker class. */
+  int ArenaSize(ITypeSymbol t)
+  {
+    var n = t as INamedTypeSymbol;
+    if (n == null || n.TypeKind != TypeKind.Class) return 0;
+    n = n.OriginalDefinition;
+    if (arenaSizes.TryGetValue(n, out int size)) return size;
+    size = 0;
+    foreach (var a in n.GetAttributes())
+      if (a.AttributeClass != null && a.AttributeClass.Name == "MaxInstancesAttribute" && a.ConstructorArguments.Length == 1
+          && a.ConstructorArguments[0].Value is int v)
+        size = v;
+    arenaSizes[n] = size;
+    return size;
+  }
+  bool IsArena(ITypeSymbol t) { return t != null && ArenaSize(t) > 0; }
+
+  /** Is this `null` a reference to an arena object?  Where it is assigned, passed or returned, C# converts it to that type; in `x == null` it is
+      converted to `object` (reference equality), so what matters is the type of the other operand. */
+  bool NullIsArena(LiteralExpressionSyntax l)
+  {
+    if (IsArena(model.GetTypeInfo(l).ConvertedType)) return true;
+    SyntaxNode at = l;
+    while (at.Parent is ParenthesizedExpressionSyntax) at = at.Parent;
+    if (at.Parent is BinaryExpressionSyntax be && (be.IsKind(SyntaxKind.EqualsExpression) || be.IsKind(SyntaxKind.NotEqualsExpression))) {
+      var other = be.Left == at ? be.Right : be.Left;
+      return IsArena(model.GetTypeInfo(other).Type);
+    }
+    return false;
   }
 
   /** A method returning its own class that does `return this;` is a fluent API.  C# returns the same
@@ -621,6 +728,9 @@ class CrustEmitter
 
   void Method(MethodDeclarationSyntax md, INamedTypeSymbol owner, bool isInterface)
   {
+    //a foreign C function (`[Cpp("pb2_step({0})")] public static extern int Step(..);`) is declared by the header its type includes; there is
+    //nothing to emit, and its calls spell the template
+    if (Has(md.Modifiers, SyntaxKind.ExternKeyword) && CppTemplate(model.GetDeclaredSymbol(md)) != null) return;
     RefuseExtern(md, md.Modifiers);
     CheckTypeParams(md);
     if (md.ExplicitInterfaceSpecifier != null)
@@ -874,6 +984,7 @@ class CrustEmitter
       string name = FlatName(n);
       if (n.TypeArguments.Length > 0)
         name += "<" + string.Join(", ", n.TypeArguments.Select(a => TypeName(a, at))) + ">";
+      if (IsArena(n)) { ArenaClasses.Add(name); return name + " *"; }       //a reference to an arena object
       return name;
     }
     Refuse(at, "type `" + t.ToDisplayString() + "` is not in the Crust C# subset.");
@@ -1084,6 +1195,24 @@ class CrustEmitter
     string e = Expr(fe.Expression);
     // a class element is borrowed: iterate by reference so nothing is copied
     string amp = IsOwnedClass(info.Type) ? "& " : " ";
+    if (IsArena(info.Type)) {
+      //a reference to an arena object is a pointer, and cpprust's range-for does not take one reliably (a spelled-out pointer type is not
+      //lowered; with `auto` a static container's bound comes out wrong).  An indexed loop is exact -- and the collection is read for each
+      //element, so it must not be a call or have a side effect.
+      if (!IsPure(fe.Expression))
+        Refuse(fe.Expression, "`foreach` over arena references needs a variable, field or property to iterate, not a call: assign the collection to a local first.");
+      string ix = NewTemp("_fe");
+      o.At(line, "for (int " + ix + " = 0; " + ix + " < " + e + ".size(); " + ix + " = " + ix + " + 1)");
+      o.Text("{ " + t + " " + Ident(fe.Identifier.Text) + " = " + e + "[" + ix + "];");
+      if (fe.Statement is BlockSyntax fb) {
+        foreach (var st in fb.Statements) Stmt(st);
+        o.At(LineOf(fb.CloseBraceToken), "}");
+      } else {
+        Stmt(fe.Statement);
+        o.At(LineOf(fe.Statement.GetLastToken()), "}");
+      }
+      return;
+    }
     o.At(line, "for (" + t + amp + Ident(fe.Identifier.Text) + " : " + e + ")");
     Body(fe.Statement);
   }
@@ -1162,8 +1291,9 @@ class CrustEmitter
         } else if (init is ArrayCreationExpressionSyntax ac) {
           piece = t + " " + name + " = " + NewArray(ac);
         } else if (init is LiteralExpressionSyntax lit && lit.IsKind(SyntaxKind.NullLiteralExpression)) {
-          Refuse(init, "`null` is not in the Crust C# subset for owned classes: a class is a value, not a reference. Construct it, or use an arena class.");
-          piece = "";
+          if (!IsArena(ls.Type))
+            Refuse(init, "`null` is not in the Crust C# subset for owned classes: a class is a value, not a reference. Construct it, or use an arena class.");
+          piece = t + " " + name + " = NULL";
         } else if ((IsOwnedClass(ls.Type) || IsList(ls.Type) || ls.Type is IArrayTypeSymbol) && IsFresh(init)) {
           piece = t + " " + name + " = " + Expr(init);
         } else if (IsFluentCall(init)) {
@@ -1202,6 +1332,7 @@ class CrustEmitter
       al = ioc.ArgumentList;
     }
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, init).ToList();
+    if (IsArena(type)) return t + " " + name + " = new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";
     if (CppTemplate(type) != null) {
       if (args.Count > 0) Refuse(init, "`new " + type.Name + "(..)` with arguments is not in the Crust C# subset. Construct it empty and fill it.");
       return t + " " + name;
@@ -1225,11 +1356,19 @@ class CrustEmitter
     if (at != null && (IsOwnedClass(at) || IsList(at) || at is IArrayTypeSymbol)
         && IsFresh(a.Expression) && !(a.Expression is ArrayCreationExpressionSyntax))
       text = Hoist(a, at);
+    else if (at != null && IsStructValue(at) && Unparen(a.Expression) is BaseObjectCreationExpressionSyntax)
+      text = Hoist(a, at);                      //`f(new Handle2D(i, g))`: a constructor call is not an expression in C, so the value is built in a local first
     else
       text = Expr(a.Expression);
     var pt = ParamTypeOf(a);
     if (pt != null && at != null && NeedsUpcast(at, pt)) return Upcast(a, text, at, pt);
     return text;
+  }
+
+  /** a struct of the program's own (not a number, not an enum, not a foreign C type): built by a constructor */
+  bool IsStructValue(ITypeSymbol t)
+  {
+    return t.TypeKind == TypeKind.Struct && t.SpecialType == SpecialType.None && CppTemplate(t) == null && !IsLib(t);
   }
 
   /** the declared type of the parameter this argument binds to. */
@@ -1371,12 +1510,14 @@ class CrustEmitter
     switch (e) {
       case ParenthesizedExpressionSyntax p: return "(" + Expr(p.Expression) + ")";
       case LiteralExpressionSyntax l:
-        if (l.IsKind(SyntaxKind.NullLiteralExpression))
+        if (l.IsKind(SyntaxKind.NullLiteralExpression)) {
+          if (NullIsArena(l)) return "NULL";
           Refuse(l, "`null` is not in the Crust C# subset for owned classes: a class is a value, not a reference. Use an arena class `[MaxInstances(N)]` for references.");
+        }
         return l.Token.Text;
       case IdentifierNameSyntax id: return IdentifierExpr(id);
       case GenericNameSyntax gn: return IdentifierExpr(gn);
-      case ThisExpressionSyntax _: return "(*this)";
+      case ThisExpressionSyntax _: return IsArena(currentType) ? "this" : "(*this)";
       case BaseExpressionSyntax b:
         Refuse(b, "`base.M()` is not in the Crust C# subset. Call a shared protected method, or restructure.");
         return "";
@@ -1867,6 +2008,7 @@ class CrustEmitter
   {
     if (e is ThisExpressionSyntax) return "this->";
     if (IsFluentCall(e)) return Expr(e, recv: true) + "->";
+    if (IsArena(model.GetTypeInfo(e).Type)) return Expr(e) + "->";       //a reference to an arena object is a pointer
     return Expr(e) + ".";
   }
 
@@ -1891,6 +2033,13 @@ class CrustEmitter
     return callee + "(" + string.Join(", ", args) + ")";
   }
 
+  static int CountOf(string text, string what)
+  {
+    int n = 0, i = 0;
+    while ((i = text.IndexOf(what, i, StringComparison.Ordinal)) >= 0) { n++; i += what.Length; }
+    return n;
+  }
+
   /** a call to a corelib member that has a [Cpp] template. */
   string CorelibCall(InvocationExpressionSyntax inv, IMethodSymbol sym, string tpl)
   {
@@ -1911,6 +2060,12 @@ class CrustEmitter
         recv = RecvText(ma.Expression);
       }
       var args = inv.ArgumentList.Arguments;
+      //a template that spells the receiver or an argument twice (`{this}.erase({this}.begin() + {0})`) evaluates it twice: only sound if that is invisible
+      if (recv != null && CountOf(tpl, "{this}") > 1 && inv.Expression is MemberAccessExpressionSyntax rma && !IsPure(rma.Expression))
+        Refuse(inv, "`" + sym.Name + "` uses its receiver twice in C, and `" + rma.Expression + "` has a side effect that would happen twice. Assign it to a local first.");
+      for (int ai = 0; ai < args.Count; ai++)
+        if (CountOf(tpl, "{" + ai + "}") + CountOf(tpl, "{" + ai + ":c}") > 1 && !IsPure(args[ai].Expression))
+          Refuse(args[ai], "`" + sym.Name + "` uses argument " + ai + " twice in C, and `" + args[ai].Expression + "` has a side effect that would happen twice. Assign it to a local first.");
       //only the arguments the template spells as {N} are materialised: `{0:c}` of a literal needs no temporary
       var plain = new HashSet<int>();
       foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(tpl, @"\{(\d+)\}"))
@@ -2057,6 +2212,7 @@ class CrustEmitter
         Refuse(oc.Initializer, "object / collection initializers are not in the Crust C# subset. Assign the fields on the next lines.");
     } else if (e is ImplicitObjectCreationExpressionSyntax ioc) al = ioc.ArgumentList;
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, e).ToList();
+    if (IsArena(type)) return "new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";     //cpprust: T__alloc(..)
     return TypeName(type, e) + "(" + string.Join(", ", args) + ")";
   }
 
@@ -2067,6 +2223,10 @@ class CrustEmitter
     var at = (IArrayTypeSymbol)model.GetTypeInfo(ac).Type;
     if (at.Rank > 1) Refuse(ac, "multidimensional arrays are not in the Crust C# subset. Use a jagged array `T[][]`.");
     var elem = at.ElementType;
+    if (IsArena(elem)) {
+      TypeName(elem, ac);                                  //(names the class, for its forward declaration)
+      return FlatName((INamedTypeSymbol)elem) + "::__new_array(" + Expr(ac.Type.RankSpecifiers[0].Sizes[0]) + ")";
+    }
     string d = DefaultInit(elem);
     if (d == null)
       Refuse(ac, "`new T[n]` of a class or struct is not in the Crust C# subset: the elements would be null. Use a List<T> and Add, or an arena class.");
@@ -2260,8 +2420,4 @@ class CrustEmitter
 
   // ------------------------------------------------------------------ finish
 
-  public string FinishPreamble(string text)
-  {
-    return text.Replace("_CS_PREAMBLE_ ", preamble.ToString());
-  }
 }

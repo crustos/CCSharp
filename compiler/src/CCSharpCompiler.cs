@@ -53,6 +53,8 @@ namespace CCSharpCompiler;
     public static bool no_npe_checks = false;
     public static bool no_abe_checks = false;
     public static bool crust = true;           //the Crust back end is the default; --gc selects the legacy GC back end
+    public static string dnaCorlib;            //--dna-corlib=FILE : DotNetAnywhere's corlib.dll, which the managed classes are compiled against
+    public static bool dna;                    //--dna : classes Crust refuses (and [Managed] ones) stay C# and run on DotNetAnywhere; see Partition.cs
     public static string srcListPath;          //--srclist=FILE : the C# files of the program, one per line (a whole project, or several folders)
     public static string corelibPath;          //--corelib=DIR : the C# corelib sources (default: found from --home / the compiler)
     public static string coostPath;            //--coost=DIR   : informational, build.py passes it to the C++ side
@@ -146,6 +148,12 @@ namespace CCSharpCompiler;
         if (arg == "--crust") {
           crust = true;
           if (value.Length > 0) crustPath = value;
+        }
+        if (arg == "--dna") {
+          dna = true;
+        }
+        if (arg == "--dna-corlib" && value.Length > 0) {
+          dnaCorlib = value;
         }
         if (arg == "--gc") {
           Console.WriteLine("Error: the GC back end was removed with its corelib (see the git history before the Crust corelib).  CC# now emits Crust C++ only.");
@@ -347,35 +355,100 @@ namespace CCSharpCompiler;
       foreach (Source node in files) node.model = compiler.GetSemanticModel(node.tree);
       files = CrustOrder(files);
       Directory.CreateDirectory(cppFolder);
-      var em = new CrustEmitter(main);
+      //--dna: decide which classes are native and which managed before anything is written
+      PartitionPlan plan = null;
+      BridgePlan bridge = null;
+      var tuples = files.Select(f => (f.tree, f.model, f.csFile)).ToList();
+      if (dna) {
+        plan = PartitionPlan.Declare(tuples);
+        var probe = new CrustEmitter(main) { plan = plan, probing = true };
+        foreach (Source node in files) probe.EmitFile(node);
+        CrustEmitter.entryCall = null; CrustEmitter.entryReturnsInt = false; CrustEmitter.entryTakesArgs = false;   //(the probe is not the program)
+        CrustEmitter.entryCandidates.Clear();
+        plan.Build(tuples, main == null ? null : main.Replace("::", "."));
+        if (plan.Errors.Count == 0) {   //(a conflict already named is the cause of the references that follow from it)
+          bridge = BridgePlan.Build(plan);
+          //a native class that uses a managed class in a way that cannot cross follows it to the managed side (never the other way: the class
+          //it uses is not pulled across).  That changes what crosses, so decide again, until nothing more moves.
+          for (int round = 0; round < 50 && bridge.Demotable.Count > 0; round++) {
+            foreach (var kv in bridge.Demotable) kv.Key.Demoted = kv.Value;
+            plan.Rebuild(tuples, main == null ? null : main.Replace("::", "."));
+            if (plan.Errors.Count > 0) break;
+            bridge = BridgePlan.Build(plan);
+          }
+          plan.Errors.AddRange(bridge.Errors);
+          plan.Bridge = bridge;
+        }
+        if (plan.Errors.Count > 0) {
+          foreach (var err in plan.Errors) Console.WriteLine(err);
+          Console.WriteLine("CCSharp --dna: " + plan.Errors.Count + " problem(s) with the native/managed partition");
+          Environment.Exit(1);
+        }
+      }
+      var em = new CrustEmitter(main) { plan = plan };
       var includes = new StringBuilder();
+      var allPieces = new List<CrustEmitter.CppPiece>();
       foreach (Source node in files) {
-        string text = em.EmitFile(node);
-        if (text == null) continue;
-        string outFile = cppFolder + "/" + Path.GetFileName(node.cppFile);
-        File.WriteAllText(outFile, text);
-        includes.Append("#include \"" + Path.GetFileName(node.cppFile) + "\"\n");
+        var pieces = em.EmitFile(node);
+        if (pieces == null) continue;
+        allPieces.AddRange(pieces);
+        //the whole file, to read (and for tools that check lines): the program is built from the pieces below, not from this
+        File.WriteAllText(cppFolder + "/" + Path.GetFileName(node.cppFile), FileView(pieces));
+      }
+      foreach (var piece in OrderPieces(allPieces)) {
+        File.WriteAllText(cppFolder + "/" + piece.Name + ".cpp", piece.Text);
+        includes.Append("#include \"" + piece.Name + ".cpp\"\n");
       }
       if (em.errors.Count > 0) {
         foreach (var err in em.errors) Console.WriteLine(err);
         Console.WriteLine("CCSharp --crust: " + em.errors.Count + " construct(s) outside the Crust C# subset");
         Environment.Exit(1);
       }
-      if (CrustEmitter.entryCall == null && !library) {
+      bool managedEntry = plan != null && (plan.ManagedEntry != null || plan.GlobalStatementFiles.Count > 0);
+      if (CrustEmitter.entryCall == null && !library && !managedEntry) {
         Console.WriteLine("Error: no `static int Main()` / `static void Main()` / `Main(string[] args)` found" + (main != null ? " in " + main : ""));
         Environment.Exit(1);
       }
       var inc = new StringBuilder("#include <stdio.h>\n");
       if (em.UsesStrcmp) inc.Append("#include <string.h>\n");
+      if (bridge != null && bridge.UsesString) em.UsesString = true;
+      if (bridge != null) foreach (var h in bridge.Includes) em.Includes.Add(h);       //(what a foreign function in an export needs)
       if (em.UsesString) em.Includes.Add("\"cs/core.h\"");                    //fastring, whichever way the string came about
       foreach (var h in em.Includes) inc.Append("#include " + h + "\n");      //what the corelib members used need
-      if (!library && main == null && CrustEmitter.entryCandidates.Count > 1) {
-        Console.WriteLine("Error: " + CrustEmitter.entryCandidates.Count + " entry points: "
-          + string.Join(", ", CrustEmitter.entryCandidates.Select(c => c.Replace("::Main", ".Main").Replace("_", "."))) + "\n  Say which one with --main=Class.");
+      var allEntries = CrustEmitter.entryCandidates.Select(c => c.Replace("::Main", ".Main").Replace("_", ".")).ToList();
+      if (plan != null) allEntries.AddRange(plan.ManagedEntries.Select(c => c + ".Main"));
+      if (!library && main == null && allEntries.Count > 1) {
+        Console.WriteLine("Error: " + allEntries.Count + " entry points: "
+          + string.Join(", ", allEntries) + "\n  Say which one with --main=Class.");
         Environment.Exit(1);
       }
-      string aggregate = inc.ToString() + includes.ToString() + (library ? "" : em.EmitMain());
+      string aggregate = inc.ToString() + (bridge != null ? bridge.CppProxies() : "") + em.Preamble + "\n" + includes.ToString() + (bridge != null ? bridge.CppExports() : "")
+        + (library ? "" : em.EmitMain());
       File.WriteAllText(cppFolder + "/" + target + ".main.cpp", aggregate);   //".main.cpp": a file's own output never has a dot in its stem, so this cannot collide
+      if (plan != null) {
+        File.WriteAllText(cppFolder + "/" + target + ".partition.json", plan.ToJson());
+        var managed = plan.WriteManagedSources(tuples, cppFolder + "/managed");
+        if (bridge.NeedsManagedExtras) {
+          File.WriteAllText(cppFolder + "/managed/_Bridge.cs", bridge.CsProxies());
+          managed.Add(cppFolder + "/managed/_Bridge.cs");
+        }
+        if (bridge.ToNative.Any()) File.WriteAllText(cppFolder + "/" + target + ".ffi.json", bridge.FfiManifest());
+        if (bridge.Methods.Count > 0 || managedEntry)
+          File.WriteAllText(cppFolder + "/" + target + ".bridge.c", bridge.GlueC(target, CrustEmitter.entryCall == null && managedEntry));
+        if (dnaCorlib != null && managed.Count > 0) {
+          bool exe = plan.ManagedEntry != null && CrustEmitter.entryCall == null;
+          var merr = ManagedBuild.Compile(managed, dnaCorlib, cppFolder + "/" + target + ".managed.dll", exe, plan.ManagedEntry);
+          if (merr.Count > 0) {
+            foreach (var e in merr) Console.WriteLine(e);
+            Console.WriteLine("CCSharp --dna: the managed classes did not compile against " + dnaCorlib);
+            Environment.Exit(1);
+          }
+          Console.WriteLine("CCSharp --dna: built " + cppFolder + "/" + target + ".managed.dll");
+        }
+        Console.WriteLine("CCSharp --dna: " + plan.NativeClasses.Count() + " native class(es), " + plan.ManagedClasses.Count() + " managed ("
+          + managed.Count + " file(s) in " + cppFolder + "/managed)");
+        foreach (var mc in plan.ManagedClasses) Console.WriteLine("  managed " + mc.Name + ": " + mc.Reason);
+      }
       Console.WriteLine("CCSharp --crust generated " + cppFolder + "/" + target + ".main.cpp");
     }
 
@@ -432,6 +505,111 @@ namespace CCSharpCompiler;
     }
 
     /** a file whose types use another file's types comes after it. */
+    /** A file's pieces as one text, each at its own source line (`#line` where one starts): for reading, and for tools that check where a line went. */
+    static string FileView(List<CrustEmitter.CppPiece> pieces)
+    {
+      var sb = new StringBuilder();
+      foreach (var p in pieces) {
+        string t = p.Text.TrimStart('\n');
+        int lead = p.Text.Length - t.Length;
+        if (lead > 0 || sb.Length > 0) sb.Append("#line ").Append(lead + 1).Append('\n');      //(a piece at the top of the file needs none)
+        sb.Append(t).Append('\n');
+      }
+      return sb.ToString();
+    }
+
+    /** The program's types in the order they are included.  The base order is the one that has always worked (files after the files they use, a type after
+        its bases).  It is kept, except where C needs a type declared before something that cpprust's own ordering does not see:
+          * a STATIC variable (a pool: `static Ball[] pool`) is a variable at file scope; it comes after the arena class whose pointers or container it holds,
+            and a class that uses another class's static variable comes after that class;
+          * a class that dereferences an arena class (calls its methods, reads its fields) comes after it, because a reference to one is a pointer, which
+            cpprust does not count as a dependency;
+          * a value class embedded in another by value comes before it.
+        Types that need each other (a cycle: two arena classes that use each other's fields) keep their base order among themselves; the rest is a
+        topological order, so it cannot oscillate. */
+    static List<CrustEmitter.CppPiece> OrderPieces(List<CrustEmitter.CppPiece> pieces)
+    {
+      var byType = new Dictionary<ISymbol, CrustEmitter.CppPiece>(SymbolEqualityComparer.Default);
+      foreach (var p in pieces) if (p.Sym != null) byType[p.Sym.OriginalDefinition] = p;
+      CrustEmitter.CppPiece PieceOf(ITypeSymbol t)
+      {
+        while (t is IArrayTypeSymbol at) t = at.ElementType;
+        if (t is INamedTypeSymbol nt) { var o = nt; while (o.ContainingType != null) o = o.ContainingType; if (byType.TryGetValue(o.OriginalDefinition, out var pc)) return pc; }
+        return null;
+      }
+      IEnumerable<CrustEmitter.CppPiece> Named(ITypeSymbol t)
+      {
+        var pc = PieceOf(t);
+        if (pc != null) yield return pc;
+        if (t is INamedTypeSymbol nt) foreach (var a in nt.TypeArguments) foreach (var x in Named(a)) yield return x;
+        if (t is IArrayTypeSymbol at) foreach (var x in Named(at.ElementType)) yield return x;
+      }
+      bool IsArenaPiece(CrustEmitter.CppPiece p) { return p.Sym != null && ArenaClass.Is(p.Sym); }
+      bool IsStaticVar(ISymbol sym)
+      {
+        if (!sym.IsStatic) return false;
+        if (sym is IFieldSymbol f) return !f.IsConst && f.ContainingType.TypeKind != TypeKind.Enum;
+        if (sym is IPropertySymbol pr) return pr.GetMethod != null && pr.GetMethod.DeclaringSyntaxReferences.Any(r => r.GetSyntax() is AccessorDeclarationSyntax ad && ad.Body == null && ad.ExpressionBody == null);
+        return false;
+      }
+      // what each piece needs to come first
+      var needs = new Dictionary<CrustEmitter.CppPiece, List<CrustEmitter.CppPiece>>();
+      foreach (var p in pieces) {
+        var set = new List<CrustEmitter.CppPiece>();
+        void Add(CrustEmitter.CppPiece x) { if (x != null && x != p && !set.Contains(x)) set.Add(x); }
+        foreach (var n in p.Decl.DescendantNodes().OfType<SimpleNameSyntax>()) {
+          var sym = p.Model.GetSymbolInfo(n).Symbol;
+          if (sym == null) continue;
+          var owner = sym.ContainingType != null ? PieceOf(sym.ContainingType) : null;
+          if (owner != null && IsStaticVar(sym)) Add(owner);                                     // a static variable it uses
+          if (owner != null && IsArenaPiece(owner) && !sym.IsStatic && !(sym is INamedTypeSymbol)) Add(owner);   // an arena object's member it dereferences
+        }
+        foreach (var m in p.Decl.DescendantNodes().OfType<MemberDeclarationSyntax>().Where(m => m is FieldDeclarationSyntax || m is PropertyDeclarationSyntax)) {
+          var syms = m is FieldDeclarationSyntax fd ? fd.Declaration.Variables.Select(v => p.Model.GetDeclaredSymbol(v)) : new[] { p.Model.GetDeclaredSymbol(m) };
+          foreach (var sy in syms) {
+            ITypeSymbol ty = sy is IFieldSymbol f ? f.Type : sy is IPropertySymbol pr ? pr.Type : null;
+            if (ty == null) continue;
+            foreach (var x in Named(ty)) {
+              if (!IsArenaPiece(x)) Add(x);                                                      // a value class it embeds
+              else if (sy.IsStatic) Add(x);                                                      // the arena class whose pointers a static pool holds
+            }
+          }
+        }
+        needs[p] = set;
+      }
+      // Strongly connected components (Tarjan): a group of types that need each other has no order that satisfies them all, so it keeps the base order,
+      // which is the one cpprust is known to handle; the groups themselves are ordered so that what a group needs comes before it.  Tarjan emits a
+      // component after every component it needs, and visits in the base order, so what nothing constrains stays where it was.
+      var baseIndex = new Dictionary<CrustEmitter.CppPiece, int>();
+      for (int i = 0; i < pieces.Count; i++) baseIndex[pieces[i]] = i;
+      var order = new List<CrustEmitter.CppPiece>();
+      var index = new Dictionary<CrustEmitter.CppPiece, int>();
+      var low = new Dictionary<CrustEmitter.CppPiece, int>();
+      var onStack = new HashSet<CrustEmitter.CppPiece>();
+      var stack = new Stack<CrustEmitter.CppPiece>();
+      int counter = 0;
+      void Connect(CrustEmitter.CppPiece v)
+      {
+        index[v] = low[v] = counter++;
+        stack.Push(v);
+        onStack.Add(v);
+        foreach (var w in needs[v].OrderBy(x => baseIndex[x])) {
+          if (!index.ContainsKey(w)) { Connect(w); low[v] = Math.Min(low[v], low[w]); }
+          else if (onStack.Contains(w)) low[v] = Math.Min(low[v], index[w]);
+        }
+        if (low[v] == index[v]) {
+          var comp = new List<CrustEmitter.CppPiece>();
+          CrustEmitter.CppPiece w;
+          do { w = stack.Pop(); onStack.Remove(w); comp.Add(w); } while (w != v);
+          order.AddRange(comp.OrderBy(x => baseIndex[x]));
+        }
+      }
+      foreach (var p in pieces) if (!index.ContainsKey(p)) Connect(p);
+      if (Environment.GetEnvironmentVariable("CCS_DEBUG_ORDER") == "1")
+        File.WriteAllText("/tmp/ccs_order.log", string.Join("\n", order.Select((p, i) => i + " " + p.Name + (order.IndexOf(p) != pieces.IndexOf(p) ? "   (was " + pieces.IndexOf(p) + ")" : ""))) + "\n");
+      return order;
+    }
+
     List<Source> CrustOrder(List<Source> list)
     {
       var declaredIn = new Dictionary<ISymbol, Source>(SymbolEqualityComparer.Default);
