@@ -121,6 +121,32 @@ def assemble(program, outdir, name="unit"):
     return path, files
 
 
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"[ \t]*\r?\n', re.M)
+
+
+def hoist_foreign_includes(c):
+    """A quoted `#include` that cpprust left in its output is a header it could not find: a foreign C library's (a program that names a C struct
+    with [Crust.Cpp] and includes the header with [Crust.CppInclude]).  cpprust gives it no body, so the declarations are the C compiler's to
+    find, but its prototypes and container instantiations, which name the header's types, are all at the top of the file, and the include
+    stayed where the program put it: after them.  Move it to the top, after the standard headers cpprust starts with."""
+    found = []
+
+    def take(m):
+        if m.group(1) not in found:
+            found.append(m.group(1))
+        return ""
+    c = _QUOTED_INCLUDE.sub(take, c)
+    if not found:
+        return c
+    block = "".join('#include "%s"\n' % n for n in found)
+    anchor = "#include <stdbool.h>\n"
+    i = c.find(anchor)
+    if i < 0:
+        return block + c
+    i += len(anchor)
+    return c[:i] + block + c[i:]
+
+
 def lower(unit_cc, out_c):
     """cpprust: C++ subset -> C.  Called in-process (not the CLI) because C# allows a type to use one declared
     below it, which is cpprust's `any_order`; that is API-only.  Everything else is coost's own build.py setting.
@@ -139,6 +165,7 @@ def lower(unit_cc, out_c):
         raise RuntimeError(getattr(e, "message", None) and str(e) or str(e))
     c = cpprust._sub_code(r"(?<![\w])NULL(?![\w])", lambda m: "((void *)0)", c)
     c = c.replace("#pragma once\n", "")        # headers are spliced into one unit; their guards are noise
+    c = hoist_foreign_includes(c)
     with open(out_c, "w") as f:
         f.write(c)
     return c

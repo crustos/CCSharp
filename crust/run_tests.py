@@ -10,6 +10,8 @@ A case is  tests/NAME.cs  (or a folder tests/NAME/ of .cs files).  The first lin
     // refuse: some text     the compile must be REFUSED, and the message must contain the text
     // expect-rc: 3          override the reference exit status (when there is no .NET to ask)
     // main: Class           the entry point to use when the program has several Main methods
+    // dna                   build it with --dna: a class Crust cannot lower, or marked [Managed], runs on DotNetAnywhere.  The case declares
+                             its own `class ManagedAttribute : Attribute {}` so that it is also a plain C# program for .NET.
 
 Refusals are tested as pinned behaviour: for this subset a refusal is the deliverable.
 """
@@ -87,6 +89,8 @@ def header(p):
             m = re.match(r"//\s*(refuse|expect-rc|main):\s*(.*)$", line)
             if m:
                 meta[m.group(1)] = m.group(2).strip()
+            elif re.match(r"//\s*dna\s*$", line):
+                meta["dna"] = "1"
             elif line.strip() and not line.startswith("//"):
                 break
     return meta
@@ -106,14 +110,18 @@ def check_lines(files, cpp_dir):
         if not os.path.exists(out):
             continue
         virt = {}
-        cur = 0
-        for i, line in enumerate(open(out).read().split("\n"), 1):
-            m = re.match(r"#line (\d+)", line)
-            if m:
-                cur = int(m.group(1)) - 1
+        #a file's arena classes are a piece of their own (rel.arena.cpp), each with the line numbers of the source
+        for piece in (out, os.path.join(cpp_dir, rel + ".arena.cpp")):
+            if not os.path.exists(piece):
                 continue
-            cur = cur + 1 if cur else i
-            virt.setdefault(cur, []).append(line)
+            cur = 0
+            for i, line in enumerate(open(piece).read().split("\n"), 1):
+                m = re.match(r"#line (\d+)", line)
+                if m:
+                    cur = int(m.group(1)) - 1
+                    continue
+                cur = cur + 1 if cur else i
+                virt.setdefault(cur, []).append(line)
         for n, line in enumerate(open(cs).read().split("\n"), 1):
             if line.strip().startswith("//"):
                 continue
@@ -124,6 +132,10 @@ def check_lines(files, cpp_dir):
 
 def run_case(name, path):
     meta = header(path)
+    if "dna" in meta:
+        have, why = ccs2c.dna_available()
+        if not have:
+            return (True, "SKIPPED (--dna: %s)" % why)
     src = path
     tmpdir = None
     if not os.path.isdir(path):
@@ -151,7 +163,7 @@ def run_case(name, path):
     try:
         if "refuse" in meta:
             try:
-                cpp, d = ccs2c.to_cpp(inp, meta.get("main"))
+                cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna="dna" in meta)
                 ccs2c.to_c(cpp, d)
             except ccs2c.Refused as e:
                 return (meta["refuse"] in str(e), "refused: " + str(e).splitlines()[-2][:150] if str(e).strip() else str(e))
@@ -160,12 +172,13 @@ def run_case(name, path):
             return (False, "expected a refusal containing %r, got a translation" % meta["refuse"])
         ref = dotnet_reference(files, meta.get("main"))
         try:
-            cpp, d = ccs2c.to_cpp(inp, meta.get("main"))
-            lp = check_lines(files, d)
+            dna = "dna" in meta
+            cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna)
+            lp = [] if dna else check_lines(files, d)        # (a --dna program has classes that are not in the C++ at all)
             if lp:
                 return (False, "line numbers moved: " + "; ".join(lp[:3]))
             c = ccs2c.to_c(cpp, d)
-            rc, out = ccs2c.build_run(c)
+            rc, out = ccs2c.build_run_dna(c, d) if dna else ccs2c.build_run(c)
             note = ""
             if os.environ.get("SHIVYC") == "1":               # opt-in: Crust's own compiler must agree with gcc
                 try:
