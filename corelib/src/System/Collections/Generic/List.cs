@@ -23,10 +23,12 @@ namespace System.Collections.Generic {
       public extern void Dispose();
     }
 
+    // (an index out of range is unchecked, as indexing is: C# throws, here it is the C vector's behaviour)
+    [Cpp("{this}.erase({this}.begin() + {0})")]                        public extern void RemoveAt(int index);
+    [Cpp("{this}.insert({this}.begin() + {0}, {1})")]                  public extern void Insert(int index, T item);
+
     public extern bool Contains(T item);                  // not implemented yet
     public extern bool Remove(T item);
-    public extern void RemoveAt(int index);
-    public extern void Insert(int index, T item);
     public extern int IndexOf(T item);
     public extern void Sort();
     public extern T[] ToArray();
