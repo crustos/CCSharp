@@ -65,6 +65,10 @@ namespace System {
     public const float PositiveInfinity = 1.0f / 0.0f;
     public const float NegativeInfinity = -1.0f / 0.0f;
     public const float NaN = 0.0f / 0.0f;
+    [Cpp("({0} != {0})")]                                public static extern bool IsNaN(float v);
+    [Cpp("({0} == 1.0f / 0.0f)")]                    public static extern bool IsPositiveInfinity(float v);
+    [Cpp("({0} == -1.0f / 0.0f)")]                   public static extern bool IsNegativeInfinity(float v);
+    [Cpp("({0} == 1.0f / 0.0f || {0} == -1.0f / 0.0f)")]      public static extern bool IsInfinity(float v);
     public extern string ToString();
   }
   public struct Double {
@@ -74,6 +78,10 @@ namespace System {
     public const double PositiveInfinity = 1.0 / 0.0;
     public const double NegativeInfinity = -1.0 / 0.0;
     public const double NaN = 0.0 / 0.0;
+    [Cpp("({0} != {0})")]                                public static extern bool IsNaN(double v);
+    [Cpp("({0} == 1.0 / 0.0)")]                    public static extern bool IsPositiveInfinity(double v);
+    [Cpp("({0} == -1.0 / 0.0)")]                   public static extern bool IsNegativeInfinity(double v);
+    [Cpp("({0} == 1.0 / 0.0 || {0} == -1.0 / 0.0)")]      public static extern bool IsInfinity(double v);
     public extern string ToString();
   }
 

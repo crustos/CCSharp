@@ -11,9 +11,9 @@ namespace System {
   public class Object {
     public Object() {}
     public extern Type GetType();                                   // no reflection in Crust
-    public extern string ToString();
-    public extern bool Equals(object other);
-    public extern int GetHashCode();
+    public virtual extern string ToString();
+    public virtual extern bool Equals(object other);
+    public virtual extern int GetHashCode();
   }
 
   public abstract class ValueType {}
@@ -32,6 +32,10 @@ namespace System {
   }
 
   public interface IDisposable { void Dispose(); }
+  public delegate int Comparison<in T>(T x, T y);
+  public interface IComparable { int CompareTo(object obj); }
+  public interface IComparable<in T> { int CompareTo(T other); }
+  public interface IEquatable<T> { bool Equals(T other); }
 
   public delegate void Action();
   public delegate void Action<in T>(T arg);
@@ -93,6 +97,8 @@ namespace System.Collections.Generic {
   public interface IEnumerator<out T> : IDisposable, System.Collections.IEnumerator { T Current { get; } }
   public interface IEnumerable<out T> : System.Collections.IEnumerable { new IEnumerator<T> GetEnumerator(); }
   public interface ICollection<T> : IEnumerable<T> { int Count { get; } }
+  public interface IComparer<in T> { int Compare(T x, T y); }
+  public interface IEqualityComparer<in T> { bool Equals(T x, T y); int GetHashCode(T obj); }
   public interface IList<T> : ICollection<T> { T this[int index] { get; set; } }
 }
 
