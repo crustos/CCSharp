@@ -101,7 +101,7 @@ the statement could observe the reordering; otherwise it is refused, never reord
 ## Not yet
 
 * `throw` / `try` -> Crust's checked `raise` / `except`; lambdas; `[Shared]` and `[MaxInstances(N)]` arenas (which
-  also unlock `null` and reference identity); nested types; operator overloading; `char`; string `Split` / `Join`
+  also unlock `null` and reference identity); nested types; operators on a class (a struct's are supported); `char`; string `Split` / `Join`
   / `Format`; `Dictionary<string, ..>` (Crust orders map keys with a `compare` method fastring does not have).
 * A string field is the empty string until assigned (C# has `null`).
 * shivyc: coost's `fs` and `time` need `<errno.h>`, which it does not bundle, so programs using `File` /

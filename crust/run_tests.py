@@ -122,8 +122,16 @@ def check_lines(files, cpp_dir):
                     continue
                 cur = cur + 1 if cur else i
                 virt.setdefault(cur, []).append(line)
+        inactive = False                    #inside `#if !CRUST` (the program is parsed with CRUST defined, so the region is not emitted)
         for n, line in enumerate(open(cs).read().split("\n"), 1):
-            if line.strip().startswith("//"):
+            st = line.strip()
+            if st.startswith("#if") and re.sub(r"\s+", "", st[3:]) == "!CRUST":
+                inactive = True
+                continue
+            if inactive and (st.startswith("#else") or st.startswith("#endif")):
+                inactive = False
+                continue
+            if inactive or st.startswith("//"):
                 continue
             if re.search(r"\breturn\b", line) and not any("return" in l for l in virt.get(n, [])):
                 problems.append("%s:%d `return` is not on line %d of the output" % (os.path.basename(cs), n, n))
