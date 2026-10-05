@@ -198,6 +198,63 @@ The semantics are Crust's, not .NET's. `crust/README.md` has the full mapping.
   could differ, CC# evaluates into temporaries in order, or refuses.
 * Array and `Dictionary` indexing is unchecked, as in C.
 
+## Native and managed: `--dna`
+
+Some C# cannot be lowered to the Crust subset (lambdas, `try`/`catch`, generic methods, LINQ ...). With `--dna` such a class is not an
+error: it stays C#, is compiled to CIL, and runs on [DotNetAnywhere](https://github.com/crustos/DotNetAnywhere) (DNA), a small .NET runtime in
+C, linked into the same executable. No .NET installation is needed to run the result. The rest is still lowered to C, and the two sides call each other.
+
+```sh
+python3 build.py deps --dna                     # clones ../DotNetAnywhere (needs mono-mcs too: it builds DNA's corlib)
+python3 build.py run --dna Prog.cs              # or compile / convert / test
+```
+
+**The unit is the class.** Each class is *native* (Crust C++, then C) or *managed* (C#, run by DNA). By default a class is tried as native, and
+if Crust refuses it, it becomes managed and the reason is printed. Two attributes (in the `Crust` namespace, or a marker class of your own
+with that name) override the default:
+
+```csharp
+[Managed] class Script { ... }   // never lowered, even if it could be
+[Native]  class Kernel { ... }   // must be lowered: a refusal is an error, never a silent fall back
+```
+
+A class, its base class and its interfaces must be on the same side, so one managed member makes the whole family managed (a `[Native]`
+member of such a family is an error). Enums and attribute classes exist on both sides; delegates are managed. `Main` may be on either side.
+
+**What crosses the boundary** is what C can hold: `bool`, the integer types, `float`, `double`, `string` (UTF-8) and one-dimensional arrays of
+the numeric types (copied in, and copied back after the call, so the callee's writes are seen; `bool[]` is not allowed). Between the two sides
+you can call static methods with those types, and in one direction, objects:
+
+* **Native code may hold objects of managed classes.** It can construct one, call its methods, read and write its properties, and pass it to
+  managed methods (`Counter c = new Counter(5); c.Add(2); c.Count = 3; Holder.Use(c);`). The native class that stands for the managed one
+  owns a *handle*: a number for which DotNetAnywhere's runtime keeps the object alive, together with everything the object refers to. The
+  constructor makes it and the destructor releases it, so **the managed object lives exactly as long as the scope of the native variable that
+  holds it** (a native class is a value, destroyed at scope exit). Run a program with `CCS_CHECK_HANDLES=1` and it reports, and exits 71,
+  if it ends with a handle that was never released.
+* **Managed code may not use an instance of a native class** (a variable, `new`, a method, a field), only call its static methods.
+
+Everything else is refused where it is used, once for each pair of classes, saying what to do: a field of a managed object (make it a
+property), an indexer, a user-defined operator, `ref`/`out`, a generic or overloaded method, a managed class with a base class, derived
+classes or an interface of the program, a struct, a method that *returns* an object, a managed object passed *from managed code to native
+code*, or any other type. A native method that returns an array cannot be called from managed code yet (return a string, or fill an array
+parameter), and a call from managed code to C takes at most 6 C arguments (an array is two).
+
+Calls nest freely (native calls managed calls native ...), and a static field keeps its value from call to call on either side. A managed
+method called from native code must not block (`Sleep`, a lock, I/O); one that throws and is not caught ends the process, as in Crust.
+
+How it is made, for each program (see `compiler/src/Partition.cs` and `Bridge.cs`, and `native/src/Host.h` in DNA):
+
+| piece | what it is |
+|---|---|
+| `NAME.partition.json` | every class, its side and why, and every method that crosses |
+| `managed/*.cs`, `NAME.managed.dll` | the managed classes, line for line as in your files, compiled by Roslyn against DNA's own `corlib.dll` |
+| proxy classes in the C++ | `Script::Go(..)` and `Counter c(5); c.Add(2)` where native code uses managed ones: the call sites are unchanged; a proxy for an object owns its handle |
+| `__ccs_bridge` in the managed C# | the static methods (`Counter_Add(self, ..)`) through which DNA, which calls only static methods, reaches an instance |
+| `ccs_x_*` in the C++ | the native methods that managed code reaches with `[DllImport]`, with an FFI manifest (`NAME.ffi.json`) so that is a direct call |
+| `NAME.bridge.c` | the C that marshals into DNA's host API (and `main`, when `Main` is managed) |
+
+The executable finds `NAME.managed.dll` and `corlib.dll` beside itself, wherever it is started. `--dna` has only been run on Linux.
+
 ## The corelib
 
 `corelib/src` is C# declarations compiled by Roslyn **instead of** the .NET reference assemblies, so it is the whole
@@ -232,17 +289,20 @@ python3 build.py test --shivyc         # ... and with Crust's own compiler too
 
 * `crust/test_inputs.py` tests what counts as a program: files, folders, `.csproj` and `.sln`, and converting several
   inputs as one.
+* `crust/test_partition.py` tests `--dna`'s partition and bridge: what goes native or managed, the diagnostics, and the files written.
 * `crust/tests` holds a case per file or folder. Each runs through CC# and gcc, and its **stdout and exit status are
   compared with the same C# run on real .NET** (when `dotnet` is available). A case that is a folder holding a `.sln` or
   `.csproj` is converted *as that project*. `refuse_*.cs` cases pin a refusal's message. `// main: Class` in a case's
-  first file selects its entry point.
+  first file selects its entry point. A `// dna` case is built with `--dna` (and skipped, loudly, where DotNetAnywhere or `mcs` is missing); it
+  defines its own `class ManagedAttribute : Attribute {}`, so it is also an ordinary C# program for the .NET it is compared with.
 * A line check asserts that every `return` is on its C# line in the generated C++.
 
 ## Layout
 
 ```
 build.py            builds, tests, and runs everything (this file's commands)
-compiler/src        the compiler: CCSharpCompiler.cs (driver) and CrustEmitter.cs (the Crust back end)
+compiler/src        the compiler: CCSharpCompiler.cs (driver) and CrustEmitter.cs (the Crust back end);
+                    --dna: Partition.cs (native or managed), Bridge.cs (what crosses), ManagedBuild.cs (managed C# to CIL)
 corelib/src         the C# class library      corelib/native   its C++ side, on coost
 crust/              ccs2c.py (the pipeline), inputs.py (files/projects), unit.py (coost splicing), tests, docs
 examples/           example1 (hello), example2 (a List<string> benchmark)

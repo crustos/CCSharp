@@ -6,9 +6,15 @@ CC# needs two sibling checkouts, beside this repository:
     ../crust    https://github.com/brentharts/crust   cpprust (C++ subset -> C); its shivyc is an optional C compiler
     ../coost    https://github.com/crustos/coost      the string / fs / path / time library the corelib sits on
 
+and, for --dna only, a third:
+
+    ../DotNetAnywhere   https://github.com/crustos/DotNetAnywhere   a .NET runtime in C: runs the classes Crust cannot lower
+                                                                    (the version with native/src/Host.h; also needs mono-mcs)
+
 BUILD
     python3 build.py                  deps, compiler, coost, corelib, test, examples
     python3 build.py deps             clone crust and coost beside this repo (the only step that needs a network)
+    python3 build.py deps --dna       ... and DotNetAnywhere too
     python3 build.py compiler         build build/compiler/ccs.dll with the Roslyn inside the .NET SDK (no NuGet)
     python3 build.py coost            build coost with its own build.py (`--test` also runs coost's tests)
     python3 build.py corelib          check the corelib: the C# compiles, the native helpers lower and compile
@@ -35,12 +41,14 @@ OPTIONS
     --debug          compile with -g -O0 instead of -O2
     --shivyc         use Crust's own compiler (shivyc) instead of gcc.  Experimental: see README.md.
                      With `test` (or no command): also compile each test case with shivyc and require agreement.
+    --dna            a class Crust cannot lower (or marked [Managed]) stays C# and runs on DotNetAnywhere, called from the native code
+                     and calling it (static methods, for now).  With `test`: the --dna cases are skipped if DotNetAnywhere or mcs is missing.
     --offline        never touch the network: a missing dependency is an error that says what to clone
     --update         deps: `git pull --ff-only` the dependencies
     --no-test        with no command: skip the test step
     --test           coost: also run coost's own tests
 
-ENVIRONMENT   CRUST_HOME, COOST_HOME (dependency locations), DOTNET (the dotnet executable), CC (the C compiler)
+ENVIRONMENT   CRUST_HOME, COOST_HOME, DNA_HOME (dependency locations), DOTNET (the dotnet executable), CC (the C compiler)
 NEEDS         python3, git (deps only), a C compiler, and the .NET SDK 8+ (its Roslyn compiles the compiler)
 """
 import glob
@@ -61,6 +69,12 @@ DEPS = {
     "crust": ("https://github.com/brentharts/crust.git", os.path.join("tools", "cpprust.py")),
     "coost": ("https://github.com/crustos/coost.git", os.path.join("include", "co", "fastring.h")),
 }
+# needed only by --dna.  native/src/Host.h is what makes the runtime embeddable: a checkout without it is not the right one.
+OPTIONAL_DEPS = {
+    "dna": ("https://github.com/crustos/DotNetAnywhere.git", os.path.join("native", "src", "Host.h")),
+}
+DIRNAMES = {"dna": "DotNetAnywhere"}                    # (where a dependency lives beside this repo, when that is not its key)
+ALL_DEPS = dict(DEPS, **OPTIONAL_DEPS)
 
 
 def say(msg):
@@ -92,11 +106,11 @@ def capture(cmd, cwd=None):
 # ---- dependencies ---------------------------------------------------------------------------------------------
 
 def dep_path(name):
-    return os.environ.get(name.upper() + "_HOME") or os.path.join(SIBLINGS, name)
+    return os.environ.get(name.upper() + "_HOME") or os.path.join(SIBLINGS, DIRNAMES.get(name, name))
 
 
 def dep_ok(name):
-    return os.path.exists(os.path.join(dep_path(name), DEPS[name][1]))
+    return os.path.exists(os.path.join(dep_path(name), ALL_DEPS[name][1]))
 
 
 def dep_rev(name):
@@ -105,8 +119,9 @@ def dep_rev(name):
 
 
 def cmd_deps(opts):
-    step("dependencies (crust and coost, beside this repository)")
-    for name, (url, probe) in DEPS.items():
+    wanted = dict(DEPS, **(OPTIONAL_DEPS if opts["dna"] else {}))
+    step("dependencies (%s, beside this repository)" % " and ".join(wanted))
+    for name, (url, probe) in wanted.items():
         path = dep_path(name)
         if dep_ok(name):
             if opts["update"] and not opts["offline"] and os.path.isdir(os.path.join(path, ".git")):
@@ -121,14 +136,17 @@ def cmd_deps(opts):
             die("git is needed to clone %s (or put a checkout at %s)" % (name, path))
         run(["git", "clone", url, path])
         if not dep_ok(name):
-            die("cloned %s but %s is missing" % (url, probe))
+            die("cloned %s but %s is missing%s" % (url, probe, "\n  (--dna needs the version of DotNetAnywhere that has native/src/Host.h)" if name == "dna" else ""))
         say("  %-6s %s   %s" % (name, path, dep_rev(name)))
 
 
-def require_deps():
+def require_deps(opts=None):
     for name in DEPS:
         if not dep_ok(name):
             die("%s not found at %s.  Run `python3 build.py deps` (clones it beside this repo)." % (name, dep_path(name)))
+    if opts and opts.get("dna") and not dep_ok("dna"):
+        die("--dna needs DotNetAnywhere at %s (the version with %s).\n  Run `python3 build.py deps --dna`, or set DNA_HOME."
+            % (dep_path("dna"), ALL_DEPS["dna"][1]))
 
 
 def env_for_children():
@@ -136,6 +154,8 @@ def env_for_children():
     env["CRUST_HOME"] = dep_path("crust")
     env["COOST_HOME"] = dep_path("coost")
     env["CRUST"] = dep_path("crust")                      # coost's build.py reads CRUST
+    if dep_ok("dna"):
+        env["DNA_HOME"] = dep_path("dna")
     if os.path.exists(COMPILER_DLL):
         env["CCS"] = "%s %s" % (dotnet(), COMPILER_DLL)
     return env
@@ -296,6 +316,9 @@ def cmd_test(opts):
         say("  note: no dotnet, so there is no .NET reference to compare with")
     if not opts["names"]:
         run([sys.executable, os.path.join(ROOT, "crust", "test_inputs.py")], env=env)          # what counts as a program
+        run([sys.executable, os.path.join(ROOT, "crust", "test_partition.py")], env=env)       # --dna: native / managed classes
+        run([sys.executable, os.path.join(ROOT, "crust", "test_foreign.py")], env=env)         # extern members with a [Cpp] template
+        run([sys.executable, os.path.join(ROOT, "crust", "test_arena.py")], env=env)           # arena classes, foreign headers and types
     run([sys.executable, os.path.join(ROOT, "crust", "run_tests.py")] + opts["names"], env=env)
 
 
@@ -314,6 +337,8 @@ def ccs2c_cmd(opts, *extra):
         cmd.append("--debug")
     if opts["shivyc"]:
         cmd.append("--shivyc")
+    if opts["dna"]:
+        cmd.append("--dna")
     return cmd + list(extra)
 
 
@@ -341,7 +366,7 @@ def cmd_examples(opts):
 
 
 def cmd_run(opts):
-    require_deps()
+    require_deps(opts)
     require_compiler()
     r = subprocess.run(ccs2c_cmd(opts, "--run", "--", *opts["rest"]), env=env_for_children())
     sys.exit(r.returncode)
@@ -355,14 +380,14 @@ def tool(cmd):
 
 
 def cmd_compile(opts):
-    require_deps()
+    require_deps(opts)
     require_compiler()
     exe = os.path.abspath(opts["out"]) if opts["out"] else os.path.join(BUILD, "bin", program_name(opts))
     tool(ccs2c_cmd(opts, "--exe=" + exe))
 
 
 def cmd_convert(opts):
-    require_deps()
+    require_deps(opts)
     require_compiler()
     dest = os.path.abspath(opts["out"]) if opts["out"] else os.path.join(BUILD, "convert", program_name(opts))
     tool(ccs2c_cmd(opts, "--convert=" + dest, *(["--c"] if opts["c"] else [])))
@@ -376,6 +401,9 @@ def cmd_status(opts):
     for name in DEPS:
         say("  %-9s %s  %s" % (name, dep_path(name) if dep_ok(name) else dep_path(name) + "  (MISSING: python3 build.py deps)",
                               dep_rev(name) if dep_ok(name) else ""))
+    say("  %-9s %s  %s" % ("dna", dep_path("dna") if dep_ok("dna") else dep_path("dna") + "  (optional, for --dna: python3 build.py deps --dna)",
+                          dep_rev("dna") if dep_ok("dna") else ""))
+    say("  mcs       %s   (--dna: compiles DotNetAnywhere's corlib)" % (shutil.which("mcs") or "(not found)"))
     d = os.environ.get("DOTNET") or shutil.which("dotnet")
     say("  dotnet    %s" % (d or "(not found)"))
     if d:
@@ -418,10 +446,10 @@ COMMANDS = {
 
 
 def main(argv):
-    opts = {"offline": False, "update": False, "shivyc": False, "no_test": False, "coost_test": False, "c": False,
+    opts = {"offline": False, "update": False, "shivyc": False, "dna": False, "no_test": False, "coost_test": False, "c": False,
             "debug": False, "out": None, "main": None, "name": None, "cc": None, "names": [], "rest": []}
     value_opts = {"-o": "out", "--main": "main", "--name": "name", "--cc": "cc"}
-    flag_opts = {"--offline": "offline", "--update": "update", "--shivyc": "shivyc", "--no-test": "no_test",
+    flag_opts = {"--offline": "offline", "--update": "update", "--shivyc": "shivyc", "--dna": "dna", "--no-test": "no_test",
                  "--test": "coost_test", "--c": "c", "--debug": "debug"}
     cmd = None
     i = 0
