@@ -276,8 +276,16 @@ A member declared without `[Cpp]` is part of .NET that is not implemented yet: u
 | other | `Stopwatch`, `Environment.TickCount64` / `NewLine` / `Exit` |
 
 Refused today, with a message: `char`, `null`, `throw` / `try`, lambdas and delegates, generic methods, `is` / `as`,
-LINQ, `goto`, `params`, named and optional arguments, nested types, operator overloading, array initialisers, printing
+LINQ, `goto`, `params`, named arguments, nested types, operators on a class, array initialisers, printing
 a `float` / `double`, and `Dictionary<string, ...>`.
+
+Optional arguments are supported: a call that leaves one out gets the declared default (a number, a `bool`, an enum member,
+a string, `default(struct)`, or `null` for an arena class). A default of `null` for a string or for an owned class is refused:
+neither has a null here. Operators are supported on a **struct**: `a + b`, `-a`, `a == b`, `a += b` are calls of the operator's
+static method (`op_Addition`; several of one name are told apart by their parameter types). A class has identity, so
+`a + b` would have to copy or alias it, and is refused. A struct that declares only constructors with parameters still has a
+parameterless one, as in C#. The program is parsed with `CRUST` defined, so a library can keep what the subset cannot take
+behind `#if !CRUST`.
 
 ## Tests
 
