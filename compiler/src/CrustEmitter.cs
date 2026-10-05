@@ -413,6 +413,15 @@ class CrustEmitter
       try { Member(m, sym, isInterface); }
       catch (CrustRefusal r) { Report(r); }
     }
+    //A C# struct always has a parameterless constructor (`default(V)`, `new V()`, an array of V): when it declares constructors of its own, C++ would have none.
+    //Its fields start at zero (`int A = 0;`), which is what default(V) is.
+    if (c is StructDeclarationSyntax) {
+      var ctors = c.Members.OfType<ConstructorDeclarationSyntax>().Where(k => !Has(k.Modifiers, SyntaxKind.StaticKeyword)).ToList();
+      if (ctors.Count > 0 && !ctors.Any(k => k.ParameterList.Parameters.Count == 0)) {
+        o.PadTo(LineOf(c.CloseBraceToken));
+        o.Text(FlatName(sym) + "() {}");
+      }
+    }
     o.PadTo(LineOf(c.CloseBraceToken));
     o.Text("};");
     currentType = null;
@@ -451,9 +460,7 @@ class CrustEmitter
       case MethodDeclarationSyntax md: Method(md, owner, isInterface); break;
       case ConstructorDeclarationSyntax cd: Ctor(cd, owner); break;
       case DestructorDeclarationSyntax dd: Dtor(dd, owner); break;
-      case OperatorDeclarationSyntax od:
-        Refuse(od, "operator overloading is not in the Crust C# subset yet. Write a named method.");
-        break;
+      case OperatorDeclarationSyntax od: OperatorDecl(od, owner); break;
       case IndexerDeclarationSyntax ix:
         Refuse(ix, "indexers are not in the Crust C# subset. Write `Get(i)` / `Set(i, v)` methods.");
         break;
@@ -704,7 +711,6 @@ class CrustEmitter
     var parts = new List<string>();
     foreach (var p in pl.Parameters) {
       var ps = (IParameterSymbol)model.GetDeclaredSymbol(p);
-      if (p.Default != null) Refuse(p, "default parameter values are not in the Crust C# subset. Write an overload.");
       if (p.Modifiers.Any(m => m.IsKind(SyntaxKind.ParamsKeyword)))
         Refuse(p, "`params` is not in the Crust C# subset. Pass an array.");
       if (p.Modifiers.Any(m => m.IsKind(SyntaxKind.InKeyword)))
@@ -803,6 +809,83 @@ class CrustEmitter
     entryCall = FlatName(owner) + "::Main";
     entryReturnsInt = !ms.ReturnsVoid;
     entryTakesArgs = ms.Parameters.Length == 1;
+  }
+
+  /** `public static V operator +(V a, V b)` is a static method called `op_Addition` (Roslyn's name for it); a use of the operator is a call of it (UserOperator).
+      Only for a struct: for a class `a + b` would have to copy or alias, which is exactly what the subset refuses. */
+  void OperatorDecl(OperatorDeclarationSyntax od, INamedTypeSymbol owner)
+  {
+    if (owner.TypeKind != TypeKind.Struct)
+      Refuse(od, "operator overloading is for a struct in the Crust C# subset: on a class `a + b` would have to copy or alias an object, and a class is single-owner here. Make the type a struct, or write a named method.");
+    var ms = (IMethodSymbol)model.GetDeclaredSymbol(od);
+    string head = "static " + TypeName(ms.ReturnType, od.ReturnType) + " " + OpName(ms) + "(" + ParamList(od.ParameterList) + ")";
+    if (od.ExpressionBody != null) {
+      BeginHoist();
+      currentMethod = ms;
+      string body;
+      try { body = Return(new ReturnStatementData(od.ExpressionBody.Expression)); } finally { currentMethod = null; }
+      string pre = string.Join(" ", hoisted);
+      canHoist = false; hoisted.Clear();
+      o.At(LineOf(od), head + " { " + (pre.Length > 0 ? pre + " " : "") + body + " }");
+      return;
+    }
+    o.At(LineOf(od), head);
+    currentMethod = ms;
+    try { Block(od.Body); } finally { currentMethod = null; }
+  }
+
+  /** `a + b` where + is a struct's own operator */
+  bool IsUserOperatorUse(ExpressionSyntax e)
+  {
+    while (e is ParenthesizedExpressionSyntax pp) e = pp.Expression;
+    if (!(e is BinaryExpressionSyntax || e is PrefixUnaryExpressionSyntax)) return false;
+    return model.GetSymbolInfo(e).Symbol is IMethodSymbol m && m.MethodKind == MethodKind.UserDefinedOperator && !IsLib(m);
+  }
+
+  /** The C name of an operator: Roslyn's (`op_Addition`), and when the type has several of that name (`Vec * int`, `int * Vec`, `Vec * Vec`) the parameter types
+      too, because cpprust tells overloads apart by their argument count only. */
+  string OpName(IMethodSymbol ms)
+  {
+    var same = ms.ContainingType.GetMembers(ms.Name).OfType<IMethodSymbol>().Count();
+    if (same <= 1) return Ident(ms.Name);
+    return Ident(ms.Name) + "_" + string.Join("_", ms.Parameters.Select(p => Mangle(TypeName(p.Type, null))));
+  }
+
+  /** a use of a user-defined operator: a call of its static method.  The operands of a call are not evaluated in order in C, so two that have effects are refused. */
+  string UserOperator(ExpressionSyntax whole, IMethodSymbol sym, params ExpressionSyntax[] operands)
+  {
+    if (sym.ContainingType.TypeKind != TypeKind.Struct)
+      Refuse(whole, "the operator `" + sym.Name + "` of `" + sym.ContainingType.Name + "` is not in the Crust C# subset: operators are for structs.");
+    if (sym.Name == "op_Increment" || sym.Name == "op_Decrement")
+      Refuse(whole, "`++` / `--` on a struct with an operator is not in the Crust C# subset. Write `v = v + one`.");
+    if (operands.Length == 2 && Conflicts(operands[0], operands[1]))
+      Refuse(whole, "both operands of `" + sym.Name.Replace("op_", "") + "` have effects, and a call does not evaluate its arguments in order in C. Assign one to a local first.");
+    //cpprust does not lower `v[i]` inside the arguments of a static call: an element is read into a plain local first
+    var texts = new List<string>();
+    foreach (var x in operands) {
+      string t = Expr(x);
+      var xe = x;
+      while (xe is ParenthesizedExpressionSyntax pp) xe = pp.Expression;
+      var oty = model.GetTypeInfo(x).Type;
+      if (xe is BaseObjectCreationExpressionSyntax && oty != null && IsStructValue(oty)) {
+        //a constructor call is not an expression in C: the value is built in a local
+        RequireHoist(x, "a `new " + oty.Name + "(..)` used as an operand of `" + sym.Name.Replace("op_", "") + "`");
+        var oal = (xe as ObjectCreationExpressionSyntax)?.ArgumentList ?? (xe as ImplicitObjectCreationExpressionSyntax)?.ArgumentList;
+        var oargs = oal == null ? new List<string>() : ArgTexts(oal.Arguments, xe).ToList();
+        oargs = WithDefaults(oargs.ToArray(), model.GetSymbolInfo(xe).Symbol as IMethodSymbol, xe);
+        string tmpn = NewTemp("_n");
+        hoisted.Add(TypeName(oty, x) + " " + tmpn + (oargs.Count > 0 ? "(" + string.Join(", ", oargs) + ")" : "") + ";");
+        t = tmpn;
+      } else if (xe is ElementAccessExpressionSyntax) {
+        var xty = model.GetTypeInfo(x).Type;
+        RequireHoist(x, "an element used as an operand of `" + sym.Name.Replace("op_", "") + "`");
+        string tmp = NewTemp("_e");
+        hoisted.Add(TypeName(xty, x) + " " + tmp + " = " + t + ";");
+        t = tmp;
+      }
+      texts.Add(t);
+    }
+    return FlatName(sym.ContainingType) + "::" + OpName(sym) + "(" + string.Join(", ", texts) + ")";
   }
 
   void Ctor(ConstructorDeclarationSyntax cd, INamedTypeSymbol owner)
@@ -1344,6 +1427,7 @@ class CrustEmitter
       al = ioc.ArgumentList;
     }
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, init).ToList();
+    if (CppTemplate(type) == null) args = WithDefaults(args.ToArray(), model.GetSymbolInfo(init).Symbol as IMethodSymbol, init);
     if (IsArena(type)) return t + " " + name + " = new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";
     if (CppTemplate(type) != null) return t + " " + name + CollectionCtor(type, al, init, args);
     if (args.Count == 0) return t + " " + name;
@@ -1640,6 +1724,13 @@ class CrustEmitter
 
   /** Hoisting a statement ahead of the current one is only sound when nothing else in the statement is
       evaluated before it and could be affected: every impure node must enclose it or be inside it. */
+  /** A temporary that cannot change what the statement does wherever it is built (a literal, a zero): it only needs a statement to be put before. */
+  void RequireHoistPlace(ExpressionSyntax e, string what)
+  {
+    if (!canHoist)
+      Refuse(e, what + " needs a temporary, which is only supported in a plain statement, not inside a condition or loop header. Build it on its own line first.");
+  }
+
   void RequireHoist(ExpressionSyntax e, string what)
   {
     if (!canHoist)
@@ -2041,8 +2132,68 @@ class CrustEmitter
       Refuse(inv, "generic methods are not in the Crust C# subset.");
 
     string callee = Expr(inv.Expression);
-    var args = ArgTexts(inv.ArgumentList.Arguments, inv);
+    var args = WithDefaults(ArgTexts(inv.ArgumentList.Arguments, inv), sym, inv);
     return callee + "(" + string.Join(", ", args) + ")";
+  }
+
+  /** `f(1)` for `void f(int a, int b = 5)`: the arguments the call leaves out are the declared defaults, which Roslyn knows, so the C declaration does
+      not repeat them and they are written at each call. */
+  List<string> WithDefaults(string[] given, IMethodSymbol sym, ExpressionSyntax call)
+  {
+    var all = given.ToList();
+    if (sym == null || IsLib(sym)) return all;
+    for (int i = all.Count; i < sym.Parameters.Length; i++) all.Add(DefaultArg(sym.Parameters[i], call));
+    return all;
+  }
+
+  /** the text of a parameter's default value */
+  string DefaultArg(IParameterSymbol p, ExpressionSyntax call)
+  {
+    if (!p.HasExplicitDefaultValue) { Refuse(call, "the call leaves out `" + p.Name + "`, which has no default."); return ""; }
+    var t = p.Type;
+    object v = p.ExplicitDefaultValue;
+    if (t.TypeKind == TypeKind.Enum) {
+      long n = Convert.ToInt64(v);
+      foreach (var m in t.GetMembers().OfType<IFieldSymbol>())
+        if (m.HasConstantValue && Convert.ToInt64(m.ConstantValue) == n) return FlatName((INamedTypeSymbol)t) + "_" + Ident(m.Name);      //(an enum member keeps its name)
+      return "(" + FlatName((INamedTypeSymbol)t) + ")" + n;
+    }
+    if (t.SpecialType == SpecialType.System_String) {
+      if (v == null) { Refuse(call, "the default of `" + p.Name + "` is `null`: a string is never null in Crust. Use \"\" as the default."); return ""; }
+      RequireHoistPlace(call, "the default string of `" + p.Name + "`");
+      UsesString = true;
+      string tmp = NewTemp("_s");
+      hoisted.Add("fastring " + tmp + ";");
+      AppendPart(tmp, (string)v);
+      return tmp;
+    }
+    if (v == null) {
+      if (IsArena(t)) return "NULL";                                    //a reference that refers to nothing
+      if (t.IsValueType) {                                              //default(T): `T()` is not an expression in C, so it is a named local
+        string zero = DefaultInit(t);
+        if (zero != null) return zero;
+        RequireHoistPlace(call, "the default value of `" + p.Name + "`");
+        string tmp = NewTemp("_d");
+        hoisted.Add(TypeName(t, call) + " " + tmp + ";");
+        return tmp;
+      }
+      Refuse(call, "the default of `" + p.Name + "` is `null` for `" + t.Name + "`, a class that is a value in Crust: there is no null for it. Use an arena class, or write an overload.");
+      return "";
+    }
+    if (v is bool b) return b ? "true" : "false";
+    if (v is char) { Refuse(call, "the default of `" + p.Name + "` is a `char`, which is not in the Crust C# subset. Use `byte`."); return ""; }
+    if (v is int i) return i == int.MinValue ? "(-2147483647 - 1)" : i.ToString();
+    if (v is uint u) return u + "U";
+    if (v is long l) return l == long.MinValue ? "(-9223372036854775807LL - 1)" : l + "LL";
+    if (v is ulong ul) return ul + "ULL";
+    if (v is short sh) return sh.ToString();
+    if (v is ushort us) return us.ToString();
+    if (v is byte by) return by.ToString();
+    if (v is sbyte sb) return sb.ToString();
+    if (v is double d) return Dbl(d);
+    if (v is float f) return Flt(f);
+    Refuse(call, "the default of `" + p.Name + "` (" + v.GetType().Name + ") is not in the Crust C# subset.");
+    return "";
   }
 
   static int CountOf(string text, string what)
@@ -2105,6 +2256,15 @@ class CrustEmitter
       foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(tpl, @"\{(\d+)\}"))
         plain.Add(int.Parse(m.Groups[1].Value));
       var texts = ArgTexts(args, inv, i => !plain.Contains(i) && model.GetConstantValue(args[i].Expression).HasValue);
+      for (int ai = 0; ai < args.Count; ai++) {
+        var aty = model.GetTypeInfo(args[ai].Expression).Type;
+        if (texts[ai] != null && aty != null && IsStructValue(aty) && IsUserOperatorUse(args[ai].Expression)) {
+          RequireHoist(args[ai].Expression, "an operator result passed to `" + sym.Name + "`");
+          string ot = NewTemp("_o");
+          hoisted.Add(TypeName(aty, args[ai]) + " " + ot + " = " + texts[ai] + ";");
+          texts[ai] = ot;
+        }
+      }
       return Expand(tpl, sym, recv, args, texts, sym.ContainingType.TypeArguments.ToArray(), inv);
     } finally { hoistRoot = saveRoot; }
   }
@@ -2246,6 +2406,7 @@ class CrustEmitter
         Refuse(oc.Initializer, "object / collection initializers are not in the Crust C# subset. Assign the fields on the next lines.");
     } else if (e is ImplicitObjectCreationExpressionSyntax ioc) al = ioc.ArgumentList;
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, e).ToList();
+    if (CppTemplate(type) == null) args = WithDefaults(args.ToArray(), model.GetSymbolInfo(e).Symbol as IMethodSymbol, e);
     if (IsArena(type)) return "new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";     //cpprust: T__alloc(..)
     if (CppTemplate(type) != null) return TypeName(type, e) + (CollectionCtor(type, al, e, args) is string c && c.Length > 0 ? c : "()");
     return TypeName(type, e) + "(" + string.Join(", ", args) + ")";
@@ -2325,6 +2486,8 @@ class CrustEmitter
         Refuse(b, "`??` is not in the Crust C# subset: there is no null for a value. ");
         break;
     }
+    if (model.GetSymbolInfo(b).Symbol is IMethodSymbol userOp && userOp.MethodKind == MethodKind.UserDefinedOperator && !IsLib(userOp))
+      return UserOperator(b, userOp, b.Left, b.Right);
     var lt = model.GetTypeInfo(b.Left).Type;
     var rt = model.GetTypeInfo(b.Right).Type;
     if ((lt != null && lt.SpecialType == SpecialType.System_String) || (rt != null && rt.SpecialType == SpecialType.System_String)) {
@@ -2378,6 +2541,8 @@ class CrustEmitter
   string Prefix(PrefixUnaryExpressionSyntax pu, bool statement)
   {
     string op = pu.OperatorToken.Text;
+    if (model.GetSymbolInfo(pu).Symbol is IMethodSymbol userOp && userOp.MethodKind == MethodKind.UserDefinedOperator && !IsLib(userOp))
+      return UserOperator(pu, userOp, pu.Operand);
     if (op == "++" || op == "--") {
       var prop = PropertyTarget(pu.Operand);
       if (prop != null) {
@@ -2449,6 +2614,11 @@ class CrustEmitter
       if (op == "=") return PropSet(a.Left, prop, Expr(a.Right));
       string bop = op.Substring(0, op.Length - 1);
       return PropSet(a.Left, prop, PropGet(a.Left, prop) + " " + bop + " " + Expr(a.Right));
+    }
+    if (op != "=" && model.GetSymbolInfo(a).Symbol is IMethodSymbol cop && cop.MethodKind == MethodKind.UserDefinedOperator && !IsLib(cop)) {
+      if (!statement) Refuse(a, "`" + op + "` on a struct with an operator inside a larger expression is not in the Crust C# subset. Make it a statement.");
+      if (!IsPure(a.Left)) Refuse(a, "`" + a.Left + "` has a side effect and `" + op + "` would evaluate it twice in C. Assign it to a local first.");
+      return Expr(a.Left) + " = " + UserOperator(a, cop, a.Left, a.Right);
     }
     var lt = model.GetTypeInfo(a.Left).Type;
     if (lt != null && lt.SpecialType == SpecialType.System_String) {
