@@ -24,6 +24,14 @@ namespace Crust {
   [System.AttributeUsage(System.AttributeTargets.All, AllowMultiple = false)]
   public sealed class CppAttribute : System.Attribute {
     public CppAttribute(string template) {}
+    /** C++ the template needs defined once, ahead of the code that uses it (a function that does what no single expression can). */
+    public string Helper { get; set; }
+  }
+
+  /** How assigning to a corelib property is written in C++: `{this}` is the receiver, `{0}` the value.  A property without one cannot be assigned. */
+  [System.AttributeUsage(System.AttributeTargets.Property, AllowMultiple = false)]
+  public sealed class CppSetAttribute : System.Attribute {
+    public CppSetAttribute(string template) {}
   }
 
   /** A header the generated code needs: "\"cs/core.h\"" or "<math.h>".  coost sources are spliced in by header. */
