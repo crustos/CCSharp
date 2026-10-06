@@ -255,6 +255,8 @@ How it is made, for each program (see `compiler/src/Partition.cs` and `Bridge.cs
 
 The executable finds `NAME.managed.dll` and `corlib.dll` beside itself, wherever it is started. `--dna` has only been run on Linux.
 
+A host with its own native side can use just the managed half: `dotnet build/compiler/ccs.dll --managed-compile OUT.dll CORLIB.dll FILE.cs ...` compiles C# with Roslyn against DNA's `corlib.dll` and nothing else (exit status 0 on success, errors on stderr). Crust's `unity_pack --hybrid` / `--managed` use it.
+
 ### WebAssembly: `--wasm`
 
 `--wasm` builds the same program for `wasm32-wasi` instead of the host. It implies `--dna`, so a program with managed classes gets DNA linked
