@@ -21,6 +21,10 @@ INPUT is any mix of C# files, folders, .csproj and .sln (see crust/inputs.py); t
                       once for both steps.  May be repeated.
     --dna             a class Crust cannot lower (or marked [Managed]) stays C# and runs on DotNetAnywhere, called from the native
                       code and calling it; needs DotNetAnywhere (the crustos fork) beside this repo, or DNA_HOME, and mono-mcs
+    --wasm            build for WebAssembly (wasm32-wasi) instead of for this machine: NAME.wasm, a launcher NAME that runs it under node, and
+                      beside them run_wasm.mjs (the host: it also hosts DotNetAnywhere's compiler from CIL to wasm), NAME.managed.dll and corlib.dll.
+                      Implies --dna: what Crust cannot lower runs on DotNetAnywhere inside the same module.  Needs clang, lld, wasi-libc, llvm-ar and
+                      node (see `python3 build.py status`).  --exe=PATH names the launcher; the module is PATH.wasm (or PATH, if it ends in .wasm)
 
 Pipeline:
     CCSharpCompiler --srclist=...       Roslyn: the C# files -> cpp/*.cpp
@@ -28,6 +32,7 @@ Pipeline:
     cc                                  the executable (only with --exe / --run)
 
 Environment (all default to what `python3 build.py` sets up):
+    WASI_SYSROOT  where wasi-libc is (headers in DIR/include/wasm32-wasi, libraries in DIR/lib/wasm32-wasi), for --wasm   (default /usr)
     DNA_HOME     a checkout of https://github.com/crustos/DotNetAnywhere   (default: ../DotNetAnywhere), for --dna
     CRUST_HOME   a checkout of https://github.com/brentharts/crust   (default: ../crust)
     COOST_HOME   a checkout of https://github.com/crustos/coost      (default: ../coost)
@@ -76,6 +81,63 @@ class Refused(Exception):
     pass
 
 
+def wasi_sysroot():
+    return os.environ.get("WASI_SYSROOT") or "/usr"
+
+
+def wasm_available():
+    """(True, "") when --wasm can work here, else (False, why): clang that targets wasm32 with lld, wasi-libc, llvm-ar (DotNetAnywhere's archive), node."""
+    for tool, hint in (("clang", "apt install clang"), ("wasm-ld", "apt install lld"), ("llvm-ar", "apt install llvm"),
+                       ("node", "node 20 or later runs the module")):
+        if not shutil.which(tool):
+            return False, "%s is not installed (%s)" % (tool, hint)
+    if not os.path.isdir(os.path.join(wasi_sysroot(), "include", "wasm32-wasi")):
+        return False, "no wasi-libc under %s (apt install wasi-libc libclang-rt-dev-wasm32, or set WASI_SYSROOT)" % wasi_sysroot()
+    return True, ""
+
+
+def wasm_compiler(cc=None):
+    """clang, whatever $CC says about this machine (gcc cannot target wasm); --cc names another one that can."""
+    if cc:
+        return cc
+    env = os.environ.get("CC")
+    return env if env and "clang" in os.path.basename(env) else "clang"
+
+
+def _wasm_cflags():
+    root = wasi_sysroot()
+    # -nostdlibinc: without it clang also searches this machine's /usr/include, which is the wrong libc (no wasm32 ABI)
+    return ["--target=wasm32-wasi", "--sysroot=" + root, "-nostdlibinc", "-isystem", os.path.join(root, "include", "wasm32-wasi")]
+
+
+# the stack is 8 MB, as a native program's is (wasm's default 64 KB is too small for C recursion); the table is exported and growable because the
+# host puts the functions that DotNetAnywhere compiles from CIL at run time into it (native/src/WasmJIT.c)
+_WASM_LDFLAGS = ["-fuse-ld=lld", "-Wl,-z,stack-size=8388608", "-Wl,--export-table", "-Wl,--growable-table"]
+
+
+def wasm_paths(exe):
+    """(launcher, module) for what --exe names: PATH gives PATH and PATH.wasm; PATH.wasm gives PATH and PATH.wasm."""
+    return (exe[:-5], exe) if exe.endswith(".wasm") else (exe, exe + ".wasm")
+
+
+def _wasm_package(exe, name, home, has_managed):
+    """Beside the module: the host script, and a launcher that runs it from wherever the program is started."""
+    launcher, module = wasm_paths(exe)
+    d = os.path.dirname(os.path.abspath(launcher))
+    host = os.path.join(home, "tools", "run_wasm.mjs")
+    if not os.path.exists(host):
+        raise Refused("DotNetAnywhere at %s has no tools/run_wasm.mjs (it is the host that runs a wasm build; use the version that has --wasm)" % home)
+    shutil.copy(host, os.path.join(d, "run_wasm.mjs"))
+    script = ('#!/bin/sh\n# CC# --wasm: runs %s under node.  Needs node 20 or later.\n'
+              'd=$(cd "$(dirname "$0")" && pwd)\n' % os.path.basename(module))
+    if has_managed:
+        script += '[ -z "$CCS_MANAGED_DLL" ] && [ -f "$d/%s.managed.dll" ] && export CCS_MANAGED_DLL="$d/%s.managed.dll"\n' % (name, name)
+    script += 'exec node --no-warnings "$d/run_wasm.mjs" --app "$d/%s" "$@"\n' % os.path.basename(module)
+    with open(launcher, "w") as f:
+        f.write(script)
+    os.chmod(launcher, 0o755)
+
+
 class ShivycUnavailable(Exception):
     """shivyc cannot compile this program for a reason that is shivyc's (a glibc header it does not bundle)."""
 
@@ -110,38 +172,44 @@ def dna_run(args, home, bdir):
         raise Refused("building DotNetAnywhere failed (build.py %s):\n%s" % (" ".join(args), p.stdout.decode("utf-8", "replace").strip()[-800:]))
 
 
-def dna_prepare():
+def dna_prepare(wasm=False):
     """DotNetAnywhere built into build/dna of this repo (its own objects, so the checkout's own build is left alone): the runtime library
-    libdna.a, and corlib.dll, which the managed classes are compiled against and which must sit beside them.  Returns (home, build dir)."""
+    libdna.a, and corlib.dll, which the managed classes are compiled against and which must sit beside them.  With wasm: the same for wasm32, in
+    build/dna-wasm (libdna_wasm.a).  Returns (home, build dir)."""
     home = dna_home()
-    bdir = os.path.join(REPO, "build", "dna")
-    if home not in _dna_ready:
-        dna_run(["--lib-only"], home, bdir)
+    bdir = os.path.join(REPO, "build", "dna-wasm" if wasm else "dna")
+    if (home, wasm) not in _dna_ready:
+        dna_run((["--wasm"] if wasm else []) + ["--lib-only"], home, bdir)
         if not os.path.exists(os.path.join(bdir, "corlib.dll")):
             raise Refused("DotNetAnywhere's corlib.dll was not built (it needs mcs: apt install mono-mcs)")
-        _dna_ready[home] = True
+        _dna_ready[(home, wasm)] = True
     return home, bdir
 
 
-def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False):
+def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False, wasm=False):
     """The hybrid executable: the lowered C, the glue that calls DotNetAnywhere, and the runtime (with the native functions that managed code
-    may [DllImport] in its FFI table).  The managed assembly and corlib.dll go beside it."""
-    home, bdir = dna_prepare()
+    may [DllImport] in its FFI table).  The managed assembly and corlib.dll go beside it.  With wasm: a WebAssembly module and its launcher
+    (see wasm_paths); the managed assembly and corlib.dll go beside them."""
+    home, bdir = dna_prepare(wasm)
     glue = os.path.join(cpp_dir, name + ".bridge.c")
     manifest = os.path.join(cpp_dir, name + ".ffi.json")
     if not os.path.exists(glue):                                  # nothing in this program is managed
-        return build_exe(c_text, exe, cc=cc, debug=debug)
+        return build_exe(c_text, exe, cc=cc, debug=debug, wasm=wasm)
     if os.path.exists(manifest):
-        dna_run(["--ffi", manifest, "--lib-only", "--no-corlib"], home, bdir)
-        lib = os.path.join(bdir, "libdna_ffi.a")
+        dna_run((["--wasm"] if wasm else []) + ["--ffi", manifest, "--lib-only", "--no-corlib"], home, bdir)
+        lib = os.path.join(bdir, "libdna_ffi_wasm.a" if wasm else "libdna_ffi.a")
     else:
-        lib = os.path.join(bdir, "libdna.a")
+        lib = os.path.join(bdir, "libdna_wasm.a" if wasm else "libdna.a")
+    out = wasm_paths(exe)[1] if wasm else exe
     d = os.path.dirname(os.path.abspath(exe))
     os.makedirs(d, exist_ok=True)
-    cfile = exe + ".c"
+    cfile = out + ".c"
     with open(cfile, "w") as f:
         f.write(c_text)
-    cmd = [c_compiler(cc)] + _cflags(debug) + ["-I", os.path.join(home, "native", "src"), "-o", exe, cfile, glue, lib, "-lm", "-lpthread"]
+    if wasm:
+        cmd = [wasm_compiler(cc)] + _cflags(debug) + _wasm_cflags() + ["-I", os.path.join(home, "native", "src"), "-o", out, cfile, glue, lib, "-lm"] + _WASM_LDFLAGS
+    else:
+        cmd = [c_compiler(cc)] + _cflags(debug) + ["-I", os.path.join(home, "native", "src"), "-o", exe, cfile, glue, lib, "-lm", "-lpthread"]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:
         raise Refused("C compiler failed:\n" + re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode("utf-8", "replace")).strip()[-800:])
@@ -149,6 +217,8 @@ def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False):
     if os.path.exists(dll):
         shutil.copy(dll, d)
     shutil.copy(os.path.join(bdir, "corlib.dll"), d)
+    if wasm:
+        _wasm_package(exe, name, home, os.path.exists(dll))
 
 
 def build_run_dna(c_text, cpp_dir, name="Program", args=(), timeout=60, cc=None):
@@ -168,7 +238,23 @@ def build_run_dna(c_text, cpp_dir, name="Program", args=(), timeout=60, cc=None)
         shutil.rmtree(elsewhere, ignore_errors=True)
 
 
-def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=()):
+def build_run_wasm(c_text, cpp_dir, name="Program", args=(), timeout=120, cc=None):
+    """Build the program for wasm32-wasi and run it under node: (exit status, stdout).  Like build_run_dna, it is started from another directory and
+    with the leak check on."""
+    tmp = tempfile.mkdtemp(prefix="ccs2c-wasm-")
+    elsewhere = tempfile.mkdtemp(prefix="ccs2c-cwd-")
+    try:
+        exe = os.path.join(tmp, name)
+        dna_link(c_text, cpp_dir, name, exe, cc=cc, wasm=True)
+        r = subprocess.run([exe] + list(args), cwd=elsewhere, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+                           env=dict(os.environ, CCS_CHECK_HANDLES="1"))
+        return r.returncode, r.stdout.decode("utf-8", "replace")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(elsewhere, ignore_errors=True)
+
+
+def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False):
     """C# inputs (files / folders / .csproj / .sln, one program) in; returns (cpp_text, cpp_dir).
     Raises Refused with the diagnostics."""
     if isinstance(inputs, str):
@@ -188,7 +274,7 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=()):
     if main:
         cmd.append("--main=" + main)
     if dna:
-        cmd += ["--dna", "--dna-corlib=" + os.path.join(dna_prepare()[1], "corlib.dll")]
+        cmd += ["--dna", "--dna-corlib=" + os.path.join(dna_prepare(wasm)[1], "corlib.dll")]
     p = subprocess.run(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = p.stdout.decode("utf-8", "replace")
     if p.returncode != 0:
@@ -253,10 +339,22 @@ def build_run_shivyc(c_text, args=(), timeout=60):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def build_exe(c_text, exe, shivyc=False, cc=None, debug=False):
-    """Compile lowered C to a native executable: gcc (or $CC / --cc), or Crust's own compiler (shivyc)."""
+def build_exe(c_text, exe, shivyc=False, cc=None, debug=False, wasm=False):
+    """Compile lowered C to a native executable: gcc (or $CC / --cc), or Crust's own compiler (shivyc).  With wasm: a WebAssembly module with its
+    launcher (see wasm_paths), clang with wasi-libc."""
     d = os.path.dirname(os.path.abspath(exe))
     os.makedirs(d, exist_ok=True)
+    if wasm:
+        launcher, module = wasm_paths(exe)
+        cfile = module + ".c"
+        with open(cfile, "w") as f:
+            f.write(c_text)
+        cmd = [wasm_compiler(cc)] + _cflags(debug) + _wasm_cflags() + ["-o", module, cfile, "-lm"] + _WASM_LDFLAGS
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode != 0:
+            raise Refused("C compiler failed (wasm32-wasi):\n" + re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode("utf-8", "replace")).strip()[-800:])
+        _wasm_package(exe, os.path.basename(launcher), dna_home(), False)
+        return
     cfile = exe + ".c"
     with open(cfile, "w") as f:
         f.write(c_text)
@@ -297,7 +395,7 @@ def convert(cpp_dir, dest, name, c_text=None):
 
 def parse_args(argv):
     o = {"inputs": [], "main": None, "name": None, "convert": None, "c": False, "out": None, "exe": None,
-         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "bindings": [], "include": [], "args": []}
+         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "wasm": False, "bindings": [], "include": [], "args": []}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -330,6 +428,8 @@ def parse_args(argv):
             o["shivyc"] = True
         elif a == "--dna":
             o["dna"] = True
+        elif a == "--wasm":
+            o["wasm"] = True
         elif a.startswith("--bindings="):
             o["bindings"].append(a[11:])
         elif a.startswith("--include="):
@@ -350,17 +450,26 @@ def main(argv):
     if not o["inputs"]:
         print("ccs2c: no input (a .cs file, a folder, a .csproj or a .sln)")
         return 2
+    if o["wasm"]:
+        if o["shivyc"]:
+            print("ccs2c: --shivyc cannot target wasm (it makes x86 code); --wasm uses clang")
+            return 2
+        ok, why = wasm_available()
+        if not ok:
+            print("ccs2c: --wasm: " + why)
+            return 1
+        o["dna"] = True                                  # (what Crust cannot lower runs on DotNetAnywhere inside the same module)
     name = o["name"] or inputs_mod.project_name(o["inputs"])
     need_c = o["c"] or o["out"] or o["exe"] or o["run"] or not o["convert"]
     try:
-        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"])
+        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"], wasm=o["wasm"])
         c = to_c(cpp, cpp_dir, name) if need_c else None
         if o["convert"]:
             for f in convert(cpp_dir, o["convert"], name, c if o["c"] else None):
                 print("wrote " + f)
         def build(exe):
             if o["dna"]:
-                dna_link(c, cpp_dir, name, exe, cc=o["cc"], debug=o["debug"])
+                dna_link(c, cpp_dir, name, exe, cc=o["cc"], debug=o["debug"], wasm=o["wasm"])
             else:
                 build_exe(c, exe, shivyc=o["shivyc"], cc=o["cc"], debug=o["debug"])
         if o["exe"]:
