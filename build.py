@@ -6,7 +6,7 @@ CC# needs two sibling checkouts, beside this repository:
     ../crust    https://github.com/brentharts/crust   cpprust (C++ subset -> C); its shivyc is an optional C compiler
     ../coost    https://github.com/crustos/coost      the string / fs / path / time library the corelib sits on
 
-and, for --dna only, a third:
+and, for --dna (and --wasm, which implies it), a third:
 
     ../DotNetAnywhere   https://github.com/crustos/DotNetAnywhere   a .NET runtime in C: runs the classes Crust cannot lower
                                                                     (the version with native/src/Host.h; also needs mono-mcs)
@@ -14,7 +14,7 @@ and, for --dna only, a third:
 BUILD
     python3 build.py                  deps, compiler, coost, corelib, test, examples
     python3 build.py deps             clone crust and coost beside this repo (the only step that needs a network)
-    python3 build.py deps --dna       ... and DotNetAnywhere too
+    python3 build.py deps --dna       ... and DotNetAnywhere too (--wasm needs it as well)
     python3 build.py compiler         build build/compiler/ccs.dll with the Roslyn inside the .NET SDK (no NuGet)
     python3 build.py coost            build coost with its own build.py (`--test` also runs coost's tests)
     python3 build.py corelib          check the corelib: the C# compiles, the native helpers lower and compile
@@ -43,12 +43,17 @@ OPTIONS
                      With `test` (or no command): also compile each test case with shivyc and require agreement.
     --dna            a class Crust cannot lower (or marked [Managed]) stays C# and runs on DotNetAnywhere, called from the native code
                      and calling it (static methods, for now).  With `test`: the --dna cases are skipped if DotNetAnywhere or mcs is missing.
+    --wasm           build for WebAssembly (wasm32-wasi) instead of for this machine: compile/run make NAME.wasm and a launcher NAME that runs it under
+                     node, with run_wasm.mjs, NAME.managed.dll and corlib.dll beside them.  Implies --dna (a class Crust cannot lower runs on
+                     DotNetAnywhere, with its compiler from CIL to wasm, inside the same module).  Needs clang, lld, wasi-libc, llvm-ar, node and mono-mcs.
+                     With `test`: run every case this way (each is compared with real .NET all the same).
     --offline        never touch the network: a missing dependency is an error that says what to clone
     --update         deps: `git pull --ff-only` the dependencies
     --no-test        with no command: skip the test step
     --test           coost: also run coost's own tests
 
-ENVIRONMENT   CRUST_HOME, COOST_HOME, DNA_HOME (dependency locations), DOTNET (the dotnet executable), CC (the C compiler)
+ENVIRONMENT   CRUST_HOME, COOST_HOME, DNA_HOME (dependency locations), DOTNET (the dotnet executable), CC (the C compiler),
+              WASI_SYSROOT (wasi-libc, for --wasm; default /usr)
 NEEDS         python3, git (deps only), a C compiler, and the .NET SDK 8+ (its Roslyn compiles the compiler)
 """
 import glob
@@ -119,7 +124,7 @@ def dep_rev(name):
 
 
 def cmd_deps(opts):
-    wanted = dict(DEPS, **(OPTIONAL_DEPS if opts["dna"] else {}))
+    wanted = dict(DEPS, **(OPTIONAL_DEPS if opts["dna"] or opts["wasm"] else {}))
     step("dependencies (%s, beside this repository)" % " and ".join(wanted))
     for name, (url, probe) in wanted.items():
         path = dep_path(name)
@@ -144,8 +149,8 @@ def require_deps(opts=None):
     for name in DEPS:
         if not dep_ok(name):
             die("%s not found at %s.  Run `python3 build.py deps` (clones it beside this repo)." % (name, dep_path(name)))
-    if opts and opts.get("dna") and not dep_ok("dna"):
-        die("--dna needs DotNetAnywhere at %s (the version with %s).\n  Run `python3 build.py deps --dna`, or set DNA_HOME."
+    if opts and (opts.get("dna") or opts.get("wasm")) and not dep_ok("dna"):
+        die("--dna and --wasm need DotNetAnywhere at %s (the version with %s).\n  Run `python3 build.py deps --dna`, or set DNA_HOME."
             % (dep_path("dna"), ALL_DEPS["dna"][1]))
 
 
@@ -312,6 +317,8 @@ def cmd_test(opts):
         env["SHIVYC"] = "1"
     if opts["cc"]:
         env["CC"] = opts["cc"]
+    if opts["wasm"]:
+        env["CCS_WASM"] = "1"
     if not shutil.which("dotnet"):
         say("  note: no dotnet, so there is no .NET reference to compare with")
     if not opts["names"]:
@@ -339,6 +346,8 @@ def ccs2c_cmd(opts, *extra):
         cmd.append("--shivyc")
     if opts["dna"]:
         cmd.append("--dna")
+    if opts["wasm"]:
+        cmd.append("--wasm")
     return cmd + list(extra)
 
 
@@ -404,6 +413,10 @@ def cmd_status(opts):
     say("  %-9s %s  %s" % ("dna", dep_path("dna") if dep_ok("dna") else dep_path("dna") + "  (optional, for --dna: python3 build.py deps --dna)",
                           dep_rev("dna") if dep_ok("dna") else ""))
     say("  mcs       %s   (--dna: compiles DotNetAnywhere's corlib)" % (shutil.which("mcs") or "(not found)"))
+    sys.path.insert(0, os.path.join(ROOT, "crust"))
+    import ccs2c
+    ok, why = ccs2c.wasm_available()
+    say("  wasm      %s" % ("clang + lld + wasi-libc (%s) + llvm-ar + node: --wasm can work" % ccs2c.wasi_sysroot() if ok else "--wasm cannot: " + why))
     d = os.environ.get("DOTNET") or shutil.which("dotnet")
     say("  dotnet    %s" % (d or "(not found)"))
     if d:
@@ -446,10 +459,10 @@ COMMANDS = {
 
 
 def main(argv):
-    opts = {"offline": False, "update": False, "shivyc": False, "dna": False, "no_test": False, "coost_test": False, "c": False,
+    opts = {"offline": False, "update": False, "shivyc": False, "dna": False, "wasm": False, "no_test": False, "coost_test": False, "c": False,
             "debug": False, "out": None, "main": None, "name": None, "cc": None, "names": [], "rest": []}
     value_opts = {"-o": "out", "--main": "main", "--name": "name", "--cc": "cc"}
-    flag_opts = {"--offline": "offline", "--update": "update", "--shivyc": "shivyc", "--dna": "dna", "--no-test": "no_test",
+    flag_opts = {"--offline": "offline", "--update": "update", "--shivyc": "shivyc", "--dna": "dna", "--wasm": "wasm", "--no-test": "no_test",
                  "--test": "coost_test", "--c": "c", "--debug": "debug"}
     cmd = None
     i = 0
