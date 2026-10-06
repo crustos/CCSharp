@@ -255,6 +255,22 @@ How it is made, for each program (see `compiler/src/Partition.cs` and `Bridge.cs
 
 The executable finds `NAME.managed.dll` and `corlib.dll` beside itself, wherever it is started. `--dna` has only been run on Linux.
 
+### WebAssembly: `--wasm`
+
+`--wasm` builds the same program for `wasm32-wasi` instead of the host. It implies `--dna`, so a program with managed classes gets DNA linked
+in (compiled for wasm, with its wasm JIT), and a program with nothing managed is plain wasm. It cannot be combined with `--shivyc`.
+
+```
+python3 build.py deps --wasm                    # as --dna; also checks clang, lld, wasi-libc, llvm-ar and node
+python3 build.py run --wasm Prog.cs             # or compile / convert / test
+python3 crust/ccs2c.py --wasm Prog.cs           # the same without build.py
+```
+
+You get `NAME.wasm`, `NAME` (a launcher script), `run_wasm.mjs` (the node WASI host, which also provides the JIT), and for a hybrid program
+`NAME.managed.dll` and `corlib.dll`, all kept together. Run it with `./NAME args...` (or `node run_wasm.mjs --app NAME.wasm args...`). The stack
+is 8 MB. Exit statuses and output are the same as the native build's; an uncaught trap ends the process like abort (SIGABRT).
+`CCS_WASM=1 python3 crust/run_tests.py` (or `build.py test --wasm`) runs the whole suite this way and compares with .NET as usual.
+
 ## The corelib
 
 `corelib/src` is C# declarations compiled by Roslyn **instead of** the .NET reference assemblies, so it is the whole
