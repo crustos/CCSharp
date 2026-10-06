@@ -4,6 +4,8 @@ and its stdout + exit status are compared with the same C# run on real .NET.
 
     python3 crust/run_tests.py [name ...]            (python3 build.py test sets up the environment)
     SHIVYC=1 python3 crust/run_tests.py              also compile each case with Crust's own compiler (experimental)
+    python3 crust/run_tests.py --wasm [name ...]     build every case for WebAssembly (wasm32-wasi, clang) and run it under node instead of
+                                                     building it for this machine (CCS_WASM=1 does the same); the reference is still real .NET
 
 A case is  tests/NAME.cs  (or a folder tests/NAME/ of .cs files).  The first lines may carry:
 
@@ -29,6 +31,7 @@ import ccs2c                                            # noqa: E402
 import inputs as inputs_mod                             # noqa: E402
 
 TESTS = os.path.join(HERE, "tests")
+WASM = os.environ.get("CCS_WASM") == "1"                  # --wasm: build and run every case as WebAssembly
 
 
 def dotnet_reference(files, main=None):
@@ -181,12 +184,12 @@ def run_case(name, path):
         ref = dotnet_reference(files, meta.get("main"))
         try:
             dna = "dna" in meta
-            cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna)
+            cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna, wasm=WASM)
             lp = [] if dna else check_lines(files, d)        # (a --dna program has classes that are not in the C++ at all)
             if lp:
                 return (False, "line numbers moved: " + "; ".join(lp[:3]))
             c = ccs2c.to_c(cpp, d)
-            rc, out = ccs2c.build_run_dna(c, d) if dna else ccs2c.build_run(c)
+            rc, out = ccs2c.build_run_wasm(c, d) if WASM else ccs2c.build_run_dna(c, d) if dna else ccs2c.build_run(c)
             note = ""
             if os.environ.get("SHIVYC") == "1":               # opt-in: Crust's own compiler must agree with gcc
                 try:
@@ -214,7 +217,19 @@ def run_case(name, path):
 
 
 def main(argv):
-    names = set(argv[1:])
+    global WASM
+    if "--wasm" in argv:
+        WASM = True
+    if WASM:
+        ok, why = ccs2c.wasm_available()
+        if not ok:
+            print("run_tests --wasm: " + why)
+            return 2
+        have, why = ccs2c.dna_available()
+        if not have:
+            print("run_tests --wasm: " + why)
+            return 2
+    names = set(a for a in argv[1:] if a != "--wasm")
     bad = 0
     cs = cases(names)
     for name, path in cs:
