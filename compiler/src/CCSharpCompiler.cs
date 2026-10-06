@@ -66,6 +66,14 @@ namespace CCSharpCompiler;
 
     static void Main(string[] args)
     {
+      // ccs --managed-compile OUT.dll CORLIB.dll FILE.cs ... : just the managed side (Roslyn against DotNetAnywhere's corlib), no C++.
+      // For a host that has its own native side (crust's unity_pack --hybrid); exit status 0 when it compiled, errors on stderr.
+      // An OUT ending in .exe is a console program (its one static Main), anything else a library.
+      if (args.Length >= 4 && args[0] == "--managed-compile") {
+        var merrs = ManagedBuild.Compile(args.Skip(3), args[2], args[1], args[1].EndsWith(".exe"), null);
+        foreach (var e in merrs) Console.Error.WriteLine(e);
+        Environment.Exit(merrs.Count == 0 ? 0 : 1);
+      }
       if (args.Length < 2) {
         Console.WriteLine("CC# Compiler/" + version);
         Console.WriteLine("Usage : CCSharpCompiler cs_folder project_name [options]");
