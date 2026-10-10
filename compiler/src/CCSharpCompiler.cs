@@ -74,6 +74,11 @@ namespace CCSharpCompiler;
         foreach (var e in merrs) Console.Error.WriteLine(e);
         Environment.Exit(merrs.Count == 0 ? 0 : 1);
       }
+      // ccs --lower-cpp P.main.cpp : the direct C back end (step 1): the program part of the C++ subset, lowered to C without cpprust.
+      // Exit status 3: a construct it does not handle yet (the reason on stderr).
+      if (args.Length >= 2 && args[0] == "--lower-cpp") {
+        Environment.Exit(CppLowerer.Run(args[1], args.Length > 2 && args[2].StartsWith("--foreign=") ? args[2].Substring(10) : null));
+      }
       if (args.Length < 2) {
         Console.WriteLine("CC# Compiler/" + version);
         Console.WriteLine("Usage : CCSharpCompiler cs_folder project_name [options]");
