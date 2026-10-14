@@ -305,6 +305,15 @@ static method (`op_Addition`; several of one name are told apart by their parame
 parameterless one, as in C#. The program is parsed with `CRUST` defined, so a library can keep what the subset cannot take
 behind `#if !CRUST`.
 
+### Unity types: `--unity-types`
+
+`--unity-types` makes the UnityEngine value types part of the program: `Vector2`, `Vector3`, `Quaternion`, `Color`, and the enums `ForceMode2D`, `RigidbodyType2D`
+and `Space`, in namespace `UnityEngine` (`unity/*.cs`, a plain C# source that is added to the inputs). A game says `using UnityEngine;` and carries no copy.
+Their operators are ordinary struct operators, so `a + b`, `-a`, `a * 2f`, `2f * a`, `a == b`, `a += b`, `q * v` become calls of the operator's static method
+(`Vector2::op_Addition(a, b)`), as above; the same file compiled by .NET gives the same numbers. What the subset cannot take (`Equals`, `GetHashCode`, `ToString`,
+the implicit `Vector3` to `Vector2` conversion) is behind `#if !CRUST`. `python3 crust/ccs2c.py Game.cs --unity-types --run`; a test case selects it with a
+`// unity-types` first line (`crust/tests/unity_types.cs`).
+
 ## Tests
 
 ```sh
