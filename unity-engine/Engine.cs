@@ -223,6 +223,13 @@ public abstract class MonoBehaviour : Component
     public virtual void Start() { }
     public virtual void Update() { }
     public virtual void LateUpdate() { }
+    public virtual void FixedUpdate() { }
+    public virtual void OnCollisionEnter2D(Collision2D c) { }
+    public virtual void OnCollisionStay2D(Collision2D c) { }
+    public virtual void OnCollisionExit2D(Collision2D c) { }
+    public virtual void OnTriggerEnter2D(Collider2D c) { }
+    public virtual void OnTriggerStay2D(Collider2D c) { }
+    public virtual void OnTriggerExit2D(Collider2D c) { }
 
     public override void OnAttach()
     {
@@ -278,6 +285,7 @@ public static class Engine
                 b.Start();
             }
         }
+        Physics2D.Update(Time.deltaTime);
         for (int i = 0; i < behaviours.Count; i++)
         {
             MonoBehaviour b = behaviours[i];
@@ -296,6 +304,25 @@ public static class Engine
         }
         Time.time += Time.deltaTime;
         Sweep();
+    }
+
+    public static void FixedUpdate()
+    {
+        for (int i = 0; i < behaviours.Count; i++)
+        {
+            MonoBehaviour b = behaviours[i];
+            if (b.started && b.enabled && b.gameObject.activeSelf) b.FixedUpdate();
+        }
+    }
+
+    static void ForgetPhysics(Component c)
+    {
+        Rigidbody2D rb = c as Rigidbody2D;
+        if (rb != null) Physics2D.RemoveBody(rb);
+        Collider2D col = c as Collider2D;
+        if (col != null) Physics2D.RemoveCollider(col);
+        Joint2D jn = c as Joint2D;
+        if (jn != null) Physics2D.RemoveJoint(jn);
     }
 
     /// <summary>Destroy takes effect at the end of the frame (as in Unity), and the slots go back to their arenas.</summary>
@@ -322,6 +349,7 @@ public static class Engine
             if (mb != null) RemoveBehaviour(mb);
             SpriteRenderer sr = c as SpriteRenderer;
             if (sr != null) RemoveSprite(sr);
+            ForgetPhysics(c);
         }
     }
 
@@ -378,6 +406,7 @@ public static class Engine
                 if (mb != null) RemoveBehaviour(mb);
                 SpriteRenderer sr = o as SpriteRenderer;
                 if (sr != null) RemoveSprite(sr);
+                if (c != null) ForgetPhysics(c);
                 o.OnDestroy();
                 Arena.Free(o);
             }
