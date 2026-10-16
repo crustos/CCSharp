@@ -1,4 +1,4 @@
-// refuse: an arena class with a base class or an interface is not supported
+// refuse: an arena class may derive from one other arena class and nothing else
 using System;
 class MaxInstancesAttribute : Attribute { public MaxInstancesAttribute(int n) { } }
 class Base { public int X; }
