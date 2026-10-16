@@ -19,6 +19,9 @@ INPUT is any mix of C# files, folders, .csproj and .sln (see crust/inputs.py); t
     --unity-types     the Unity value types are built in: Vector2, Vector3, Quaternion, Color and the enums ForceMode2D, RigidbodyType2D, Space, in namespace
                       UnityEngine (unity/*.cs, added to the program as if listed).  Their operators (`a + b`, `-a`, `a * 2f`, `a == b`, `a += b`) are
                       calls of the struct's operator methods, as for any struct.  A game says `using UnityEngine;` and does not carry a copy.
+    --unity-engine    a small UnityEngine, in C#: GameObject, Transform, MonoBehaviour, SpriteRenderer, Camera, Time and the loop that runs them
+                      (unity-engine/*.cs), on top of the Unity value types (so it implies --unity-types).  Its objects are arena classes (see the README), and a
+                      script is a class that derives from MonoBehaviour.
     --include=DIR     the folder the C compiler finds the foreign headers in (`-I DIR` when the C is built).  The translation does not read them: each is
                       left as an `#include` at the top of the C file, which is where its types have to be declared.  Accepted so that a build can state it
                       once for both steps.  May be repeated.
@@ -258,9 +261,10 @@ def build_run_wasm(c_text, cpp_dir, name="Program", args=(), timeout=120, cc=Non
 
 
 UNITY_DIR = os.path.join(REPO, "unity")
+UNITY_ENGINE_DIR = os.path.join(REPO, "unity-engine")
 
 
-def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False, unity_types=False):
+def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False, unity_types=False, unity_engine=False, describe=None):
     """C# inputs (files / folders / .csproj / .sln, one program) in; returns (cpp_text, cpp_dir).
     Raises Refused with the diagnostics."""
     if isinstance(inputs, str):
@@ -269,8 +273,10 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
         files = inputs_mod.expand(inputs)
         for b in bindings:                                      # code-free C# that names foreign C: part of the program
             files += [f for f in inputs_mod.expand([b]) if f not in files]
-        if unity_types:                                         # the built-in UnityEngine value types (unity/*.cs)
+        if unity_types or unity_engine:                                         # the built-in UnityEngine value types (unity/*.cs)
             files += [f for f in inputs_mod.expand([UNITY_DIR]) if f not in files]
+        if unity_engine:                                        # the engine (unity-engine/*.cs): GameObject, Transform, MonoBehaviour ...
+            files += [f for f in inputs_mod.expand([UNITY_ENGINE_DIR]) if f not in files]
     except inputs_mod.InputError as e:
         raise Refused(str(e))
     name = name or "Program"
@@ -281,6 +287,8 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
     cmd = compiler_cmd() + [files[0], name, "--crust", "--home=" + REPO, "--srclist=" + listing]
     if main:
         cmd.append("--main=" + main)
+    if describe:
+        cmd.append("--describe=" + os.path.abspath(describe))
     if dna:
         cmd += ["--dna", "--dna-corlib=" + os.path.join(dna_prepare(wasm)[1], "corlib.dll")]
     p = subprocess.run(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -288,6 +296,8 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
     if p.returncode != 0:
         raise Refused("\n".join(l for l in out.strip().splitlines() if not l.startswith("build:")))
     cpp_dir = os.path.join(work, "cpp")
+    if describe:
+        return "", cpp_dir
     with open(os.path.join(cpp_dir, name + ".main.cpp")) as f:
         return f.read(), cpp_dir
 
@@ -403,7 +413,7 @@ def convert(cpp_dir, dest, name, c_text=None):
 
 def parse_args(argv):
     o = {"inputs": [], "main": None, "name": None, "convert": None, "c": False, "out": None, "exe": None,
-         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "wasm": False, "unity_types": False, "bindings": [], "include": [], "args": []}
+         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "wasm": False, "unity_types": False, "unity_engine": False, "bindings": [], "include": [], "args": []}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -440,6 +450,8 @@ def parse_args(argv):
             o["wasm"] = True
         elif a == "--unity-types":
             o["unity_types"] = True
+        elif a == "--unity-engine":
+            o["unity_engine"] = True
         elif a.startswith("--bindings="):
             o["bindings"].append(a[11:])
         elif a.startswith("--include="):
@@ -472,7 +484,7 @@ def main(argv):
     name = o["name"] or inputs_mod.project_name(o["inputs"])
     need_c = o["c"] or o["out"] or o["exe"] or o["run"] or not o["convert"]
     try:
-        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"], wasm=o["wasm"], unity_types=o["unity_types"])
+        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"], wasm=o["wasm"], unity_types=o["unity_types"], unity_engine=o["unity_engine"])
         c = to_c(cpp, cpp_dir, name) if need_c else None
         if o["convert"]:
             for f in convert(cpp_dir, o["convert"], name, c if o["c"] else None):

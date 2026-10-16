@@ -147,6 +147,20 @@ def hoist_foreign_includes(c):
     return c[:i] + block + c[i:]
 
 
+def uses_rtti(unit_cc):
+    """Does the program (its own generated files, not the coost sources or the corelib beside it) say `dynamic_cast`?  Then cpprust is asked
+    for the type descriptors."""
+    skip = (os.path.realpath(coost_home()), os.path.realpath(os.path.join(REPO, "corelib")))
+    for f in closure([unit_cc], incdirs()):
+        rp = os.path.realpath(f)
+        if rp.startswith(skip):
+            continue
+        with open(f, errors="replace") as fh:
+            if "dynamic_cast" in fh.read():
+                return True
+    return False
+
+
 def lower(unit_cc, out_c):
     """cpprust: C++ subset -> C.  Called in-process (not the CLI) because C# allows a type to use one declared
     below it, which is cpprust's `any_order`; that is API-only.  Everything else is coost's own build.py setting.
@@ -160,7 +174,8 @@ def lower(unit_cc, out_c):
         text = f.read()
     try:
         c = cpprust.translate(text, path=unit_cc, basedir=os.path.dirname(unit_cc), incdirs=incdirs(),
-                              defines=("CO_CRUST",), clang=False, any_order=True)
+                              defines=("CO_CRUST",), clang=False, any_order=True, bodies_last=True,
+                              rtti=uses_rtti(unit_cc))       # `is` / `as` / a downcast between arena classes
     except Exception as e:                      # CppError
         raise RuntimeError(getattr(e, "message", None) and str(e) or str(e))
     c = cpprust._sub_code(r"(?<![\w])NULL(?![\w])", lambda m: "((void *)0)", c)

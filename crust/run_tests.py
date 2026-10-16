@@ -13,6 +13,7 @@ A case is  tests/NAME.cs  (or a folder tests/NAME/ of .cs files).  The first lin
     // expect-rc: 3          override the reference exit status (when there is no .NET to ask)
     // main: Class           the entry point to use when the program has several Main methods
     // unity-types          build it with --unity-types: the UnityEngine value types (unity/*.cs) are part of the program
+    // unity-engine         build it with --unity-engine: the engine too (unity-engine/*.cs), on top of the value types
     // dna                   build it with --dna: a class Crust cannot lower, or marked [Managed], runs on DotNetAnywhere.  The case declares
                              its own `class ManagedAttribute : Attribute {}` so that it is also a plain C# program for .NET.
 
@@ -95,6 +96,8 @@ def header(p):
                 meta[m.group(1)] = m.group(2).strip()
             elif re.match(r"//\s*unity-types\s*$", line):
                 meta["unity-types"] = "1"
+            elif re.match(r"//\s*unity-engine\s*$", line):
+                meta["unity-engine"] = "1"
             elif re.match(r"//\s*dna\s*$", line):
                 meta["dna"] = "1"
             elif line.strip() and not line.startswith("//"):
@@ -177,17 +180,18 @@ def run_case(name, path):
     try:
         if "refuse" in meta:
             try:
-                cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna="dna" in meta, unity_types="unity-types" in meta)
+                cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna="dna" in meta, unity_types="unity-types" in meta, unity_engine="unity-engine" in meta)
                 ccs2c.to_c(cpp, d)
             except ccs2c.Refused as e:
-                return (meta["refuse"] in str(e), "refused: " + str(e).splitlines()[-2][:150] if str(e).strip() else str(e))
+                return (meta["refuse"] in str(e), "refused: " + (str(e).splitlines()[-2] if len(str(e).splitlines()) > 1 else str(e).strip())[:150] if str(e).strip() else str(e))
             except Exception as e:
                 return (meta["refuse"] in str(e), "cpprust refused: " + str(e)[:150])
             return (False, "expected a refusal containing %r, got a translation" % meta["refuse"])
-        ref = dotnet_reference(files + (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity", "*.cs"))) if "unity-types" in meta else []), meta.get("main"))
+        ref = dotnet_reference(files + (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity", "*.cs"))) if ("unity-types" in meta or "unity-engine" in meta) else [])
+                                + (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity-engine", "*.cs"))) if "unity-engine" in meta else []), meta.get("main"))
         try:
             dna = "dna" in meta
-            cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna, wasm=WASM, unity_types="unity-types" in meta)
+            cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna, wasm=WASM, unity_types="unity-types" in meta, unity_engine="unity-engine" in meta)
             lp = [] if dna else check_lines(files, d)        # (a --dna program has classes that are not in the C++ at all)
             if lp:
                 return (False, "line numbers moved: " + "; ".join(lp[:3]))
