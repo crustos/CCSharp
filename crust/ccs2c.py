@@ -264,7 +264,7 @@ UNITY_DIR = os.path.join(REPO, "unity")
 UNITY_ENGINE_DIR = os.path.join(REPO, "unity-engine")
 
 
-def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False, unity_types=False, unity_engine=False, describe=None):
+def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False, unity_types=False, unity_engine=False, describe=None, physics="managed"):
     """C# inputs (files / folders / .csproj / .sln, one program) in; returns (cpp_text, cpp_dir).
     Raises Refused with the diagnostics."""
     if isinstance(inputs, str):
@@ -277,6 +277,7 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
             files += [f for f in inputs_mod.expand([UNITY_DIR]) if f not in files]
         if unity_engine:                                        # the engine (unity-engine/*.cs): GameObject, Transform, MonoBehaviour ...
             files += [f for f in inputs_mod.expand([UNITY_ENGINE_DIR]) if f not in files]
+            files += [f for f in inputs_mod.expand([os.path.join(REPO, "unity-physics", physics)]) if f not in files]      # the 2D physics backend
     except inputs_mod.InputError as e:
         raise Refused(str(e))
     name = name or "Program"
@@ -316,7 +317,35 @@ def _cflags(debug):
     return ["-g", "-O0", "-w"] if debug else ["-O2", "-w"]
 
 
-def build_run(c_text, args=(), timeout=30, cc=None):
+def box2d_home():
+    """The Box2D-Packed checkout: $BOX2D_HOME, else a `box2d` folder beside this repo."""
+    for d in (os.environ.get("BOX2D_HOME"), os.path.join(os.path.dirname(REPO), "box2d")):
+        if d and os.path.isfile(os.path.join(d, "box2d_pack.py")):
+            return d
+    return None
+
+
+def physics_link(physics):
+    """The compiler arguments (-I, C sources, libraries) a physics backend needs: [] for the C# one.  `box2d` builds Box2D-Packed (once, into build/box2d)
+    and links the flat shim over it (unity-physics/box2d/pb2.c)."""
+    if physics == "managed":
+        return []
+    if physics != "box2d":
+        raise Refused("--physics=%s: one of managed, box2d" % physics)
+    home = box2d_home()
+    if not home:
+        raise Refused("--physics=box2d needs the Box2D-Packed checkout: set BOX2D_HOME, or put it in a folder `box2d` beside CCSharp")
+    sys.path.insert(0, home)
+    try:
+        import box2d_pack
+        res = box2d_pack.build(None, None, build_dir=os.path.join(REPO, "build", "box2d"), repo_root=home)
+    finally:
+        sys.path.remove(home)
+    shim = os.path.join(REPO, "unity-physics", "box2d")
+    return ["-I", shim, "-I", os.path.join(res.source_dir, "include"), os.path.join(shim, "pb2.c"), res.lib, "-lpthread"]
+
+
+def build_run(c_text, args=(), timeout=30, cc=None, physics="managed"):
     """Compile lowered C with the C compiler (gcc) and run it: (exit status, stdout)."""
     tmp = tempfile.mkdtemp(prefix="ccs2c-run-")
     try:
@@ -324,7 +353,7 @@ def build_run(c_text, args=(), timeout=30, cc=None):
         with open(cfile, "w") as f:
             f.write(c_text)
         exe = os.path.join(tmp, "p")
-        p = subprocess.run([c_compiler(cc), "-w", "-o", exe, cfile, "-lm"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        p = subprocess.run([c_compiler(cc), "-w", "-o", exe, cfile] + physics_link(physics) + ["-lm"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if p.returncode != 0:
             raise Refused("generated C did not compile:\n" + p.stdout.decode("utf-8", "replace"))
         r = subprocess.run([exe] + list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
@@ -357,7 +386,7 @@ def build_run_shivyc(c_text, args=(), timeout=60):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def build_exe(c_text, exe, shivyc=False, cc=None, debug=False, wasm=False):
+def build_exe(c_text, exe, shivyc=False, cc=None, debug=False, wasm=False, physics="managed"):
     """Compile lowered C to a native executable: gcc (or $CC / --cc), or Crust's own compiler (shivyc).  With wasm: a WebAssembly module with its
     launcher (see wasm_paths), clang with wasi-libc."""
     d = os.path.dirname(os.path.abspath(exe))
@@ -379,7 +408,7 @@ def build_exe(c_text, exe, shivyc=False, cc=None, debug=False, wasm=False):
     if shivyc:
         cmd = [sys.executable, os.path.join(crust_home(), "crust"), cfile, "-o", exe]
     else:
-        cmd = [c_compiler(cc)] + _cflags(debug) + ["-o", exe, cfile, "-lm"]
+        cmd = [c_compiler(cc)] + _cflags(debug) + ["-o", exe, cfile] + physics_link(physics) + ["-lm"]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:
         raise Refused("C compiler failed:\n" + re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode("utf-8", "replace")).strip()[-800:])
@@ -413,7 +442,7 @@ def convert(cpp_dir, dest, name, c_text=None):
 
 def parse_args(argv):
     o = {"inputs": [], "main": None, "name": None, "convert": None, "c": False, "out": None, "exe": None,
-         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "wasm": False, "unity_types": False, "unity_engine": False, "bindings": [], "include": [], "args": []}
+         "run": False, "cc": None, "debug": False, "shivyc": False, "dna": False, "wasm": False, "unity_types": False, "unity_engine": False, "physics": "managed", "bindings": [], "include": [], "args": []}
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -454,6 +483,8 @@ def parse_args(argv):
             o["unity_engine"] = True
         elif a.startswith("--bindings="):
             o["bindings"].append(a[11:])
+        elif a.startswith("--physics="):
+            o["physics"] = a[10:]
         elif a.startswith("--include="):
             o["include"].append(a[10:])
         elif a.startswith("-"):
@@ -484,7 +515,7 @@ def main(argv):
     name = o["name"] or inputs_mod.project_name(o["inputs"])
     need_c = o["c"] or o["out"] or o["exe"] or o["run"] or not o["convert"]
     try:
-        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"], wasm=o["wasm"], unity_types=o["unity_types"], unity_engine=o["unity_engine"])
+        cpp, cpp_dir = to_cpp(o["inputs"], o["main"], name=name, dna=o["dna"], bindings=o["bindings"], wasm=o["wasm"], unity_types=o["unity_types"], unity_engine=o["unity_engine"], physics=o["physics"])
         c = to_c(cpp, cpp_dir, name) if need_c else None
         if o["convert"]:
             for f in convert(cpp_dir, o["convert"], name, c if o["c"] else None):
@@ -493,7 +524,7 @@ def main(argv):
             if o["dna"]:
                 dna_link(c, cpp_dir, name, exe, cc=o["cc"], debug=o["debug"], wasm=o["wasm"])
             else:
-                build_exe(c, exe, shivyc=o["shivyc"], cc=o["cc"], debug=o["debug"])
+                build_exe(c, exe, shivyc=o["shivyc"], cc=o["cc"], debug=o["debug"], physics=o["physics"])
         if o["exe"]:
             build(o["exe"])
             print("built " + o["exe"])
