@@ -220,9 +220,10 @@ public struct Vector2
     }
 #endif
 
-#if !CRUST
+    // A conversion between the two is an operator on a struct like any other: CCSharp lowers it to a call of the static method (`Vector2::op_Implicit(v)`).
     public static implicit operator Vector3(Vector2 v) { return new Vector3(v.x, v.y, 0f); }
 
+#if !CRUST
     public override bool Equals(object other) { return other is Vector2 v && this == v; }
     public override int GetHashCode() { return x.GetHashCode() ^ (y.GetHashCode() << 2); }
     public override string ToString()
