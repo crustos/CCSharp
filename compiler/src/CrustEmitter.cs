@@ -389,7 +389,7 @@ class CrustEmitter
         if (bs.SpecialType == SpecialType.System_Object || bs.SpecialType == SpecialType.System_ValueType) continue;
         if (bs.Name == "ICloneable" || bs.Name == "IEquatable" || bs.Name == "IComparable")
           Refuse(b, "base type `" + bs.Name + "` is not in the Crust C# subset.");
-        bases.Add("public " + TypeName(bs));
+        bases.Add("public " + (IsArena(bs) ? FlatName(bs) : TypeName(bs)));      //an arena base is named, not its pointer type
       }
     }
     if (bases.Count > 0) head.Append(" : " + string.Join(", ", bases));
@@ -427,6 +427,16 @@ class CrustEmitter
     currentType = null;
   }
 
+  bool HasMaxInstancesAttr(TypeDeclarationSyntax c)
+  {
+    foreach (var al in c.AttributeLists)
+      foreach (var a in al.Attributes) {
+        string n = a.Name.ToString();
+        if (n == "MaxInstances" || n == "MaxInstancesAttribute") return true;
+      }
+    return false;
+  }
+
   void CheckClassAttributes(TypeDeclarationSyntax c, INamedTypeSymbol sym)
   {
     foreach (var al in c.AttributeLists)
@@ -441,15 +451,20 @@ class CrustEmitter
             Refuse(a, "`[MaxInstances(N)]` needs a constant N greater than 0.");
           if (c.TypeParameterList != null)
             Refuse(a, "an arena class cannot be generic: each instantiation would need an arena of its own. Make the arena class concrete.");
-          if (c.BaseList != null && c.BaseList.Types.Count > 0)
-            Refuse(c.BaseList, "an arena class with a base class or an interface is not supported by CC# --crust yet.");
           if (c.Modifiers.Any(m => m.IsKind(SyntaxKind.StaticKeyword)))
             Refuse(a, "an arena class cannot be static: it has instances.");
         }
       }
-    //a class that derives from an arena class would need its own slots and a layout that begins with its base's
-    if (sym.BaseType != null && IsArena(sym.BaseType) && !IsArena(sym))
-      Refuse(c, "`" + sym.Name + "` derives from the arena class `" + sym.BaseType.Name + "`: inheriting from an arena class is not supported by CC# --crust yet.");
+    //An arena class (one with [MaxInstances(N)], or one that derives from one) may derive from one other arena class, so that a reference to it is also a
+    //reference to its base: the object begins with its base, and a pointer to it is the address of both.  A base that is not an arena class would
+    //be a value embedded in the object, and an interface is a second base with a pointer of its own.
+    if (IsArena(sym) && c.TypeParameterList != null && !HasMaxInstancesAttr(c))      //(one that says [MaxInstances] was refused above)
+      Refuse(c, "an arena class cannot be generic: each instantiation would need an arena of its own. `" + sym.Name + "` is one because it derives from the arena class `" + sym.BaseType.Name + "`.");
+    if (IsArena(sym) && c.BaseList != null && c.BaseList.Types.Count > 0) {
+      bool ok = sym.BaseType != null && IsArena(sym.BaseType) && sym.Interfaces.Length == 0;
+      if (!ok)
+        Refuse(c.BaseList, "an arena class may derive from one other arena class and nothing else: a base class that is not an arena class, or an interface, is not supported by CC# --crust yet.");
+    }
   }
 
   void Member(MemberDeclarationSyntax m, INamedTypeSymbol owner, bool isInterface)
@@ -460,7 +475,8 @@ class CrustEmitter
       case MethodDeclarationSyntax md: Method(md, owner, isInterface); break;
       case ConstructorDeclarationSyntax cd: Ctor(cd, owner); break;
       case DestructorDeclarationSyntax dd: Dtor(dd, owner); break;
-      case OperatorDeclarationSyntax od: OperatorDecl(od, owner); break;
+      case OperatorDeclarationSyntax od: OperatorDecl(od, owner, od.ReturnType); break;
+      case ConversionOperatorDeclarationSyntax cod: OperatorDecl(cod, owner, cod.Type); break;
       case IndexerDeclarationSyntax ix:
         Refuse(ix, "indexers are not in the Crust C# subset. Write `Get(i)` / `Set(i, v)` methods.");
         break;
@@ -552,7 +568,11 @@ class CrustEmitter
   // the pointer, `null` is 0, `==` compares pointers, a reference may be stored in a field, a List<T> or a T[] and passed and returned freely.
   // `new T(..)` takes the next slot, zeroed, and runs the constructor (cpprust's `T__alloc`); nothing is freed one at a time, and an (N+1)th live
   // object aborts.  Crust's side of this is `static const int __max_instances = N;` in the class (CPPRUST.md, "Arena classes").
-  // An arena class has no base class, interface or type parameter: a pointer to it is then the address of the object, whatever it is cast to.
+  // An arena class has no type parameter and no interface, and at most one base class, which is itself an arena class: the object begins with its base
+  // (cpprust lays a derived struct out as `{ Base _base; ... }`), so a pointer to it is the address of the object, whatever it is cast to.  Every class of
+  // the family has an arena of its own: `new Derived()` takes a slot of Derived's, and a `Base *` that refers to it is that slot's address.  A class that
+  // derives from an arena class is one itself, with the base's N unless it declares its own (an abstract base's N is only that default).  C# converts
+  // `Derived` to `Base` implicitly; here that is a cast (Expr), because C types the two pointers apart.
 
   Dictionary<INamedTypeSymbol, int> arenaSizes = new Dictionary<INamedTypeSymbol, int>(SymbolEqualityComparer.Default);
   public SortedSet<string> ArenaClasses = new SortedSet<string>(StringComparer.Ordinal);   //the arena classes named so far: the aggregate declares them first
@@ -560,19 +580,31 @@ class CrustEmitter
   /** N of `[MaxInstances(N)]`, else 0.  The attribute is found by name, as `[Shared]` is: a program may declare its own marker class. */
   int ArenaSize(ITypeSymbol t)
   {
+    if (t is ITypeParameterSymbol tparam) return tparam.ConstraintTypes.Select(ArenaSize).FirstOrDefault(z => z > 0);     //`T : Component` is a reference too
     var n = t as INamedTypeSymbol;
     if (n == null || n.TypeKind != TypeKind.Class) return 0;
     n = n.OriginalDefinition;
     if (arenaSizes.TryGetValue(n, out int size)) return size;
-    size = 0;
-    foreach (var a in n.GetAttributes())
-      if (a.AttributeClass != null && a.AttributeClass.Name == "MaxInstancesAttribute" && a.ConstructorArguments.Length == 1
-          && a.ConstructorArguments[0].Value is int v)
-        size = v;
+    //A class that derives from an arena class is an arena class: its objects are as much references as its base's, and a reference to one is also a
+    //reference to the base.  It has slots of its own (the arenas are per class); without an N of its own it takes its base's (ArenaClass.Size).
+    size = ArenaClass.Size(n);
     arenaSizes[n] = size;
     return size;
   }
   bool IsArena(ITypeSymbol t) { return t != null && ArenaSize(t) > 0; }
+  bool ArenaConstrained(ITypeParameterSymbol tp) { return tp.ConstraintTypes.Any(c => ArenaSize(c) > 0); }
+
+  /** A type argument as the C++ template argument: an arena class by its flat name (the class, not the pointer to it). */
+  string TemplateArg(ITypeSymbol a, SyntaxNode at)
+  {
+    if (a is ITypeParameterSymbol tp) return Ident(tp.Name);
+    if (a is INamedTypeSymbol n && IsArena(n)) return FlatName(n);
+    return TypeName(a, at);
+  }
+  string TypeArgs(IMethodSymbol m, SyntaxNode at)
+  {
+    return m.IsGenericMethod ? "<" + string.Join(", ", m.TypeArguments.Select(a => TemplateArg(a, at))) + ">" : "";
+  }
 
   /** Is this `null` a reference to an arena object?  Where it is assigned, passed or returned, C# converts it to that type; in `x == null` it is
       converted to `object` (reference equality), so what matters is the type of the other operand. */
@@ -738,8 +770,11 @@ class CrustEmitter
 
   void CheckTypeParams(MethodDeclarationSyntax md)
   {
-    if (md.TypeParameterList != null)
-      Refuse(md, "generic methods are not in the Crust C# subset. Make the enclosing class generic, or write one method per type.");
+    if (md.TypeParameterList == null) return;
+    var ms = (IMethodSymbol)model.GetDeclaredSymbol(md);
+    if (!ms.TypeParameters.All(ArenaConstrained) || Has(md.Modifiers, SyntaxKind.VirtualKeyword) || Has(md.Modifiers, SyntaxKind.AbstractKeyword)
+        || Has(md.Modifiers, SyntaxKind.OverrideKeyword))
+      Refuse(md, "generic methods are not in the Crust C# subset, except a non-virtual one whose every type parameter is constrained to an arena class (`T GetComponent<T>() where T : Component`). Make the enclosing class generic, or write one method per type.");
   }
 
   void Method(MethodDeclarationSyntax md, INamedTypeSymbol owner, bool isInterface)
@@ -768,6 +803,8 @@ class CrustEmitter
     string pl = ParamList(md.ParameterList, isMain);
     string name = Ident(md.Identifier.Text);
     var head = (isStatic ? "static " : "") + (isVirtual ? "virtual " : "") + ret + " " + name + "(" + pl + ")";
+    if (md.TypeParameterList != null)       //an arena-constrained generic method is a member template (cpprust instantiates it per type argument)
+      head = "template <" + string.Join(", ", md.TypeParameterList.Parameters.Select(p => "class " + Ident(p.Identifier.Text))) + "> " + head;
 
     if (isMain) { RegisterEntry(owner, ms); entryMethod = ms; }
 
@@ -813,12 +850,13 @@ class CrustEmitter
 
   /** `public static V operator +(V a, V b)` is a static method called `op_Addition` (Roslyn's name for it); a use of the operator is a call of it (UserOperator).
       Only for a struct: for a class `a + b` would have to copy or alias, which is exactly what the subset refuses. */
-  void OperatorDecl(OperatorDeclarationSyntax od, INamedTypeSymbol owner)
+  void OperatorDecl(BaseMethodDeclarationSyntax od, INamedTypeSymbol owner, TypeSyntax returnType)
   {
     if (owner.TypeKind != TypeKind.Struct)
       Refuse(od, "operator overloading is for a struct in the Crust C# subset: on a class `a + b` would have to copy or alias an object, and a class is single-owner here. Make the type a struct, or write a named method.");
     var ms = (IMethodSymbol)model.GetDeclaredSymbol(od);
-    string head = "static " + TypeName(ms.ReturnType, od.ReturnType) + " " + OpName(ms) + "(" + ParamList(od.ParameterList) + ")";
+    //(a conversion operator, `implicit operator Vector3(Vector2 v)`, is the static method `op_Implicit`; a use of the conversion is a call of it: Expr, Cast)
+    string head = "static " + TypeName(ms.ReturnType, returnType) + " " + OpName(ms) + "(" + ParamList(od.ParameterList) + ")";
     if (od.ExpressionBody != null) {
       BeginHoist();
       currentMethod = ms;
@@ -900,7 +938,7 @@ class CrustEmitter
       if (cd.Initializer.IsKind(SyntaxKind.ThisConstructorInitializer))
         Refuse(cd.Initializer, "`: this(..)` constructor chaining is not in the Crust C# subset. Call a shared method from each constructor.");
       var bt = owner.BaseType;
-      head += " : " + TypeName(bt) + "(" + string.Join(", ", args) + ")";
+      head += " : " + (IsArena(bt) ? FlatName(bt) : TypeName(bt)) + "(" + string.Join(", ", args) + ")";   //(an arena base is named, not its pointer type)
     }
     o.At(LineOf(cd), head);
     Block(cd.Body);
@@ -1057,7 +1095,7 @@ class CrustEmitter
       return "std::vector<" + TypeName(arr.ElementType, at) + ">";
     }
     if (t is IPointerTypeSymbol) Refuse(at, "pointers are not in the Crust C# subset.");
-    if (t is ITypeParameterSymbol tp) return Ident(tp.Name);
+    if (t is ITypeParameterSymbol tp) return Ident(tp.Name) + (ArenaSize(tp) > 0 ? " *" : "");
     if (t is INamedTypeSymbol n) {
       if (n.TypeKind == TypeKind.Delegate)
         Refuse(at, "delegates are not in the Crust C# subset. Use an interface with one method.");
@@ -1428,7 +1466,11 @@ class CrustEmitter
     }
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, init).ToList();
     if (CppTemplate(type) == null) args = WithDefaults(args.ToArray(), model.GetSymbolInfo(init).Symbol as IMethodSymbol, init);
-    if (IsArena(type)) return t + " " + name + " = new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";
+    if (IsArena(type)) {
+      //the object made is the type of the `new`, which may derive from the type of the variable (`Component c = new Mover(..)`)
+      var made = model.GetTypeInfo(init).Type;
+      return t + " " + name + " = new " + TemplateArg(IsArena(made) ? made : type, init) + "(" + string.Join(", ", args) + ")";
+    }
     if (CppTemplate(type) != null) return t + " " + name + CollectionCtor(type, al, init, args);
     if (args.Count == 0) return t + " " + name;
     return t + " " + name + "(" + string.Join(", ", args) + ")";
@@ -1585,7 +1627,32 @@ class CrustEmitter
     return Expr(e, statement: true);
   }
 
+  /** An expression's C++, with the cast C needs where C# converts an arena reference to the arena class it derives from (`Component c = mover;`, `Add(mover)`,
+      `return mover;` from a method of `Component`): the two pointers are one address, but C types them apart, and newer C compilers refuse the implicit conversion. */
+  HashSet<SyntaxNode> inConversion = new HashSet<SyntaxNode>();
+
   string Expr(ExpressionSyntax e, bool statement = false, bool recv = false)
+  {
+    //an implicit conversion the program (or the Unity types) declares, `Vector3 p = new Vector2(1f, 2f)`: a call of the operator's static method
+    if (!statement && !recv && !(e is LiteralExpressionSyntax) && !inConversion.Contains(e)) {
+      var cv = model.GetConversion(e);
+      if (cv.IsUserDefined && cv.IsImplicit && cv.MethodSymbol != null && !IsLib(cv.MethodSymbol)) {
+        inConversion.Add(e);                                  //(its operand is e itself: not converted again)
+        try { return UserOperator(e, cv.MethodSymbol, e); } finally { inConversion.Remove(e); }
+      }
+    }
+    string s = ExprRaw(e, statement, recv);
+    if (statement || recv || e is LiteralExpressionSyntax) return s;
+    var ti = model.GetTypeInfo(e);
+    if (ti.Type is INamedTypeSymbol from && ti.ConvertedType is INamedTypeSymbol to && IsArena(from) && IsArena(to)
+        && !SymbolEqualityComparer.Default.Equals(from.OriginalDefinition, to.OriginalDefinition) && DerivesFrom(from, to))
+      return "((" + TypeName(to) + ")(" + s + "))";
+    return s;
+  }
+
+  bool DerivesFrom(INamedTypeSymbol t, INamedTypeSymbol baseType) { return ArenaClass.DerivesFrom(t, baseType); }
+
+  string ExprRaw(ExpressionSyntax e, bool statement = false, bool recv = false)
   {
     if (!statement && !recv && IsFluentCall(e))
       Refuse(e, "the result of a method that returns `this` can only start a chain or be dropped: storing it would alias the object, and a class is single-owner here. Call the methods on the original variable.");
@@ -2062,8 +2129,9 @@ class CrustEmitter
     if (sym is IFieldSymbol fs && fs.IsStatic && fs.ContainingType.TypeKind != TypeKind.Enum)
       return StaticField(fs);
     if (sym is IMethodSymbol ms && ms.IsStatic)
-      return FlatName(ms.ContainingType) + "::" + Ident(ms.Name);
+      return FlatName(ms.ContainingType) + "::" + Ident(ms.Name) + TypeArgs(ms, id);
     if (sym is INamedTypeSymbol nt) return FlatName(nt);
+    if (sym is IMethodSymbol gm && gm.IsGenericMethod) return Ident(id.Identifier.Text) + TypeArgs(gm, id);
     return Ident(id.Identifier.Text);
   }
 
@@ -2090,8 +2158,8 @@ class CrustEmitter
       return Receiver(ma.Expression) + Ident(fs.Name);
     }
     if (sym is IMethodSymbol ms) {
-      if (ms.IsStatic) return FlatName(ms.ContainingType) + "::" + Ident(ms.Name);
-      return Receiver(ma.Expression) + Ident(ms.Name);
+      if (ms.IsStatic) return FlatName(ms.ContainingType) + "::" + Ident(ms.Name) + TypeArgs(ms, ma);
+      return Receiver(ma.Expression) + Ident(ms.Name) + TypeArgs(ms, ma);
     }
     if (sym is INamedTypeSymbol nt) return FlatName(nt);
     if (sym is INamespaceSymbol) return "";
@@ -2128,8 +2196,16 @@ class CrustEmitter
     string tpl = CppTemplate(sym);
     if (tpl != null) return CorelibCall(inv, sym, tpl);
     if (IsLib(sym)) RefuseUnimplemented(inv, sym);
-    if (sym.IsGenericMethod)
-      Refuse(inv, "generic methods are not in the Crust C# subset.");
+    //`Arena.Free(obj)`: an arena object given back, its slot the next `new` takes.  The class is found by name (as MaxInstances is), so a program or the
+    //engine declares its own: `static class Arena { public static void Free<T>(T o) where T : Base { } }`.  Its body is for .NET, where nothing is freed.
+    if (sym.Name == "Free" && sym.IsGenericMethod && sym.IsStatic && sym.ContainingType != null && sym.ContainingType.Name == "Arena"
+        && sym.Parameters.Length == 1 && inv.ArgumentList.Arguments.Count == 1) {
+      var freed = model.GetTypeInfo(inv.ArgumentList.Arguments[0].Expression).Type as INamedTypeSymbol;
+      if (freed == null || !IsArena(freed)) Refuse(inv, "Arena.Free needs an arena object.");
+      return FlatName(freed) + "__free(" + Expr(inv.ArgumentList.Arguments[0].Expression) + ")";
+    }
+    if (sym.IsGenericMethod && !sym.TypeParameters.All(ArenaConstrained))
+      Refuse(inv, "generic methods are not in the Crust C# subset (except one whose type parameters are constrained to an arena class).");
 
     string callee = Expr(inv.Expression);
     var args = WithDefaults(ArgTexts(inv.ArgumentList.Arguments, inv), sym, inv);
@@ -2407,7 +2483,7 @@ class CrustEmitter
     } else if (e is ImplicitObjectCreationExpressionSyntax ioc) al = ioc.ArgumentList;
     var args = al == null ? new List<string>() : ArgTexts(al.Arguments, e).ToList();
     if (CppTemplate(type) == null) args = WithDefaults(args.ToArray(), model.GetSymbolInfo(e).Symbol as IMethodSymbol, e);
-    if (IsArena(type)) return "new " + FlatName((INamedTypeSymbol)type) + "(" + string.Join(", ", args) + ")";     //cpprust: T__alloc(..)
+    if (IsArena(type)) return "new " + TemplateArg(type, e) + "(" + string.Join(", ", args) + ")";     //cpprust: T__alloc(..)
     if (CppTemplate(type) != null) return TypeName(type, e) + (CollectionCtor(type, al, e, args) is string c && c.Length > 0 ? c : "()");
     return TypeName(type, e) + "(" + string.Join(", ", args) + ")";
   }
@@ -2477,11 +2553,15 @@ class CrustEmitter
     string op = b.OperatorToken.Text;
     switch (b.Kind()) {
       case SyntaxKind.AsExpression:
-        Refuse(b, "`as` is not in the Crust C# subset: there is no runtime type information. Use a virtual method.");
-        break;
-      case SyntaxKind.IsExpression:
-        Refuse(b, "`is` is not in the Crust C# subset: there is no runtime type information. Use a virtual method.");
-        break;
+      case SyntaxKind.IsExpression: {
+        //between arena classes the object knows its type (cpprust --rtti: a descriptor in each vtable); `x is T` / `x as T` ask it
+        var target = model.GetTypeInfo(b.Right).Type;
+        var subject = model.GetTypeInfo(b.Left).Type;
+        if (!IsArena(target) || !IsArena(subject))
+          Refuse(b, "`" + (b.IsKind(SyntaxKind.AsExpression) ? "as" : "is") + "` is not in the Crust C# subset, except between arena classes. Use a virtual method.");
+        string dc = "dynamic_cast<" + TemplateArg(target, b) + " *>(" + Expr(b.Left) + ")";
+        return b.IsKind(SyntaxKind.AsExpression) ? dc : "(" + dc + " != 0)";
+      }
       case SyntaxKind.CoalesceExpression:
         Refuse(b, "`??` is not in the Crust C# subset: there is no null for a value. ");
         break;
@@ -2520,6 +2600,10 @@ class CrustEmitter
         Includes.Add("\"cs/math.h\"");
         return (model.GetTypeInfo(b).Type.SpecialType == SpecialType.System_Single ? "cs_fmodf(" : "cs_fmod(") + left + ", " + Expr(b.Right) + ")";
       }
+      //two references of different arena classes of one family (`base == derived`): C# compares the objects, here the addresses, which are equal when it does
+      if ((op == "==" || op == "!=") && lt is INamedTypeSymbol lna && rt is INamedTypeSymbol rna && IsArena(lna) && IsArena(rna)
+          && !SymbolEqualityComparer.Default.Equals(lna.OriginalDefinition, rna.OriginalDefinition))
+        return "((void *)" + left + ") " + op + " ((void *)" + Expr(b.Right) + ")";
       return left + " " + op + " " + Expr(b.Right);
     } finally { hoistRoot = saveRoot; }
   }
@@ -2597,6 +2681,26 @@ class CrustEmitter
     return "";
   }
   string PropGet(ExpressionSyntax e, IPropertySymbol ps) { return PropRecv(e, ps) + "get_" + Ident(ps.Name) + "()"; }
+  /** `p.position = new Vector3(..)`: a constructor call is not an expression in C, so a struct built for the setter is made in a local first (as for
+      an argument, Arg).  Only where that cannot change what C# evaluates: the constructor's arguments are pure. */
+  string SetterValue(ExpressionSyntax rhs)
+  {
+    var r = Unparen(rhs);
+    var ty = model.GetTypeInfo(r).Type;
+    var conv = model.GetTypeInfo(r).ConvertedType;
+    if (ty != null && IsStructValue(ty) && r is BaseObjectCreationExpressionSyntax && canHoist
+        && conv != null && SymbolEqualityComparer.Default.Equals(conv, ty)) {          //(a `new Vector2` stored in a Vector3 property is converted: Expr does that)
+      var al = (r as ObjectCreationExpressionSyntax)?.ArgumentList ?? (r as ImplicitObjectCreationExpressionSyntax)?.ArgumentList;
+      if (al == null || al.Arguments.All(x => IsPure(x.Expression))) {
+        string name = "_t" + (++tmp);
+        var args = al == null ? new List<string>() : al.Arguments.Select(x => Arg(x)).ToList();
+        hoisted.Add(args.Count == 0 ? TypeName(ty, rhs) + " " + name + ";" : TypeName(ty, rhs) + " " + name + "(" + string.Join(", ", args) + ");");
+        return name;
+      }
+    }
+    return Expr(rhs);
+  }
+
   string PropSet(ExpressionSyntax e, IPropertySymbol ps, string value)
   {
     return PropRecv(e, ps) + "set_" + Ident(ps.Name) + "(" + value + ")";
@@ -2611,7 +2715,7 @@ class CrustEmitter
     if (prop != null) {
       if (!statement) Refuse(a, "assigning a property inside a larger expression is not in the Crust C# subset. Make it a statement.");
       if (IsLib(prop)) return CorelibPropertySet(a, prop, op);
-      if (op == "=") return PropSet(a.Left, prop, Expr(a.Right));
+      if (op == "=") return PropSet(a.Left, prop, SetterValue(a.Right));
       string bop = op.Substring(0, op.Length - 1);
       return PropSet(a.Left, prop, PropGet(a.Left, prop) + " " + bop + " " + Expr(a.Right));
     }
@@ -2666,7 +2770,12 @@ class CrustEmitter
     var from = model.GetTypeInfo(ce.Expression).Type;
     var to = model.GetTypeInfo(ce).Type;
     if (to != null && to.SpecialType == SpecialType.System_Char) Refuse(ce, "`char` is not in the Crust C# subset.");
-    if (to != null && !to.IsValueType) Refuse(ce, "reference casts are not in the Crust C# subset: there is no runtime type information.");
+    if (to != null && IsArena(to) && IsArena(from))       //a downcast: null where C# throws
+      return "dynamic_cast<" + TemplateArg(to, ce) + " *>(" + Expr(ce.Expression) + ")";
+    if (to != null && !to.IsValueType) Refuse(ce, "reference casts are not in the Crust C# subset, except between arena classes: there is no runtime type information.");
+    var cv = from != null && to != null ? model.ClassifyConversion(ce.Expression, to) : default(Conversion);
+    if (cv.Exists && cv.IsUserDefined && cv.MethodSymbol != null && !IsLib(cv.MethodSymbol))      //`(Vector3)v2`, with an explicit (or implicit) operator of the program's
+      return UserOperator(ce, cv.MethodSymbol, ce.Expression);
     return "((" + TypeName(to, ce) + ")" + Expr(ce.Expression) + ")";
   }
 

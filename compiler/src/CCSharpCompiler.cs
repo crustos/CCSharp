@@ -54,6 +54,7 @@ namespace CCSharpCompiler;
     public static bool no_abe_checks = false;
     public static bool crust = true;           //the Crust back end is the default; --gc selects the legacy GC back end
     public static string dnaCorlib;            //--dna-corlib=FILE : DotNetAnywhere's corlib.dll, which the managed classes are compiled against
+    public static string describePath;         //--describe=FILE : write the program's classes and their public fields (JSON) and stop; see Describe()
     public static bool dna;                    //--dna : classes Crust refuses (and [Managed] ones) stay C# and run on DotNetAnywhere; see Partition.cs
     public static string srcListPath;          //--srclist=FILE : the C# files of the program, one per line (a whole project, or several folders)
     public static string corelibPath;          //--corelib=DIR : the C# corelib sources (default: found from --home / the compiler)
@@ -164,6 +165,9 @@ namespace CCSharpCompiler;
         }
         if (arg == "--dna") {
           dna = true;
+        }
+        if (arg == "--describe" && value.Length > 0) {
+          describePath = value;
         }
         if (arg == "--dna-corlib" && value.Length > 0) {
           dnaCorlib = value;
@@ -367,6 +371,7 @@ namespace CCSharpCompiler;
       }
       foreach (Source node in files) node.model = compiler.GetSemanticModel(node.tree);
       files = CrustOrder(files);
+      if (describePath != null) { Describe(); return; }
       Directory.CreateDirectory(cppFolder);
       //--dna: decide which classes are native and which managed before anything is written
       PartitionPlan plan = null;
@@ -540,6 +545,33 @@ namespace CCSharpCompiler;
           * a value class embedded in another by value comes before it.
         Types that need each other (a cycle: two arena classes that use each other's fields) keep their base order among themselves; the rest is a
         topological order, so it cannot oscillate. */
+    /** --describe=FILE: every class of the program (not the corelib) with its base and its public instance fields, typed by Roslyn.  A tool that
+        writes a scene as code (unity_pack) asks this instead of reading the scripts itself: the type of `speed` is the compiler's to say. */
+    void Describe()
+    {
+      var sb = new StringBuilder("{\n");
+      bool firstClass = true;
+      foreach (Source node in files) {
+        foreach (var cd in node.tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>()) {
+          var sym = node.model.GetDeclaredSymbol(cd) as INamedTypeSymbol;
+          if (sym == null) continue;
+          if (!firstClass) sb.Append(",\n");
+          firstClass = false;
+          sb.Append("  \"" + sym.Name + "\": {\"base\": " + (sym.BaseType != null && sym.BaseType.SpecialType == SpecialType.None ? "\"" + sym.BaseType.Name + "\"" : "null") + ", \"fields\": {");
+          bool firstField = true;
+          foreach (var f in sym.GetMembers().OfType<IFieldSymbol>()) {
+            if (f.IsStatic || f.IsConst || f.DeclaredAccessibility != Accessibility.Public || f.IsImplicitlyDeclared) continue;
+            if (!firstField) sb.Append(", ");
+            firstField = false;
+            sb.Append("\"" + f.Name + "\": \"" + f.Type.ToDisplayString() + "\"");
+          }
+          sb.Append("}}");
+        }
+      }
+      sb.Append("\n}\n");
+      File.WriteAllText(describePath, sb.ToString());
+    }
+
     static List<CrustEmitter.CppPiece> OrderPieces(List<CrustEmitter.CppPiece> pieces)
     {
       var byType = new Dictionary<ISymbol, CrustEmitter.CppPiece>(SymbolEqualityComparer.Default);
@@ -573,6 +605,7 @@ namespace CCSharpCompiler;
         foreach (var h in p.Helpers) Add(h);                                                       // a helper it calls
         foreach (var ty in p.NeedTypes) foreach (var x in Named(ty)) Add(x);                      // (a helper) the types it is written for
         if (p.Decl == null) { needs[p] = set; continue; }
+        if (p.Sym is INamedTypeSymbol self && self.BaseType != null) foreach (var x in Named(self.BaseType)) Add(x);   // a base class is laid out first
         foreach (var n in p.Decl.DescendantNodes().OfType<SimpleNameSyntax>()) {
           var sym = p.Model.GetSymbolInfo(n).Symbol;
           if (sym == null) continue;

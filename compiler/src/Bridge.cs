@@ -52,17 +52,40 @@ enum Dir { NativeToManaged, ManagedToNative }
 /** What a call is: a static method, a constructor, an instance method, a property's accessor, or a field read / write. */
 enum MKind { Static, Ctor, Instance, Getter, Setter, FieldGet, FieldSet }
 
-/** `[MaxInstances(N)]`: found by name, as the emitter finds it (a program may declare its own marker class). */
+/** `[MaxInstances(N)]`: found by name, as the emitter finds it (a program may declare its own marker class).  The one place that says what an arena class is:
+    the emitter, the piece order and the native/managed bridge all ask here.
+    A class that derives from an arena class is an arena class too, with its own slots: its N is the one it declares, else its base's. */
 static class ArenaClass
 {
-  public static bool Is(ITypeSymbol t)
+  /** N of the class's own `[MaxInstances(N)]`, or null when it has none (an invalid N, zero or less, is returned as it is: the emitter refuses it). */
+  public static int? OwnSize(INamedTypeSymbol n)
   {
-    var n = t as INamedTypeSymbol;
-    if (n == null || n.TypeKind != TypeKind.Class) return false;
     foreach (var a in n.OriginalDefinition.GetAttributes())
       if (a.AttributeClass != null && a.AttributeClass.Name == "MaxInstancesAttribute" && a.ConstructorArguments.Length == 1
-          && a.ConstructorArguments[0].Value is int v && v > 0)
-        return true;
+          && a.ConstructorArguments[0].Value is int v)
+        return v;
+    return null;
+  }
+
+  /** the number of slots the class's arena has; 0 when it is not an arena class */
+  public static int Size(ITypeSymbol t)
+  {
+    var n = t as INamedTypeSymbol;
+    if (n == null || n.TypeKind != TypeKind.Class) return 0;
+    n = n.OriginalDefinition;
+    int? own = OwnSize(n);
+    if (own.HasValue) return own.Value > 0 ? own.Value : 0;
+    if (n.BaseType != null && n.BaseType.SpecialType == SpecialType.None) return Size(n.BaseType);
+    return 0;
+  }
+
+  public static bool Is(ITypeSymbol t) { return Size(t) > 0; }
+
+  /** does `t` derive (however far) from the arena class `baseType`? */
+  public static bool DerivesFrom(INamedTypeSymbol t, INamedTypeSymbol baseType)
+  {
+    for (var b = t.BaseType; b != null; b = b.BaseType)
+      if (SymbolEqualityComparer.Default.Equals(b.OriginalDefinition, baseType.OriginalDefinition)) return true;
     return false;
   }
 }
