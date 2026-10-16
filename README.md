@@ -273,6 +273,39 @@ You get `NAME.wasm`, `NAME` (a launcher script), `run_wasm.mjs` (the node WASI h
 is 8 MB. Exit statuses and output are the same as the native build's; an uncaught trap ends the process like abort (SIGABRT).
 `CCS_WASM=1 python3 crust/run_tests.py` (or `build.py test --wasm`) runs the whole suite this way and compares with .NET as usual.
 
+## Reference classes: `[MaxInstances(N)]`
+
+A class is single-owner here, so a graph of objects that refer to one another (a scene of game objects and their components) needs another kind of
+class. `[MaxInstances(N)]` makes one: it has N statically allocated slots, and a reference to it is a plain pointer. Assignment copies the pointer,
+`null` is 0, `==` compares addresses, and a reference may be stored in a field, a `List<T>` or a `T[]` and passed and returned freely. `new T(..)` takes
+the next slot; nothing is freed one at a time, and an (N+1)th live object aborts. Declare the marker class yourself (`class MaxInstancesAttribute : Attribute
+{ public MaxInstancesAttribute(int n) { } }`), as the tests do.
+
+**Inheritance.** An arena class may derive from **one other arena class**, to any depth, with `virtual` / `override` / `abstract` as for any class:
+
+```csharp
+[MaxInstances(64)] abstract class Component { public int Id; public virtual void Update() { } }
+class Mover : Component { public override void Update() { Id += 1; } }          // an arena class too: 64 slots, its own
+[MaxInstances(8)] class Spinner : Component { public override void Update() { Id += 2; } }
+```
+
+* A class that derives from an arena class **is** an arena class. It has slots of its own (each class of a family has its own arena); its N is the one it
+  declares, or else its base's. An abstract base never makes objects, so its N only sets that default.
+* A reference to a derived class is also a reference to its base: `Component c = new Mover();`, `list.Add(mover)`, passing it as a `Component`, and
+  `c.Update()` reaches `Mover.Update` through the vtable. The object begins with its base, so the pointer is one address; the C# conversion is written as a cast
+  in the generated C, which therefore compiles cleanly with compilers that refuse an implicit pointer conversion (gcc 14).
+* `base == derived` compares addresses. Between arena classes `c is Mover`, `c as Mover` and `(Mover)c` ask the object its type (cpprust `--rtti`: a descriptor in
+  each class's vtable, switched on by the program saying `dynamic_cast`): `as` gives null on a miss, and so does a cast, where C# would throw. For any other
+  type they are refused as everywhere (use a virtual method).
+* **Giving a slot back.** There is no GC and no `delete` in C#, so an engine that wants to reuse slots says so: a static class named `Arena` with
+  `public static void Free<T>(T o) where T : Base { }` (the body is for .NET). A call `Arena.Free(x)` is written as `Base__free(x)`, which finds the arena the
+  object lives in by its address, drops it, zeroes it, and makes its slot the next one `new` takes. Freeing an object twice, or using it after, is the program's bug.
+* A **generic method** is allowed when every type parameter is constrained to an arena class and the method is not virtual: `T Get<T>() where T : Part`. It
+  is emitted as a C++ member template, instantiated per type argument, so `c as T` and `new T()` (with `where T : Part, new()`) work inside it.
+* Not yet: an arena class that implements an **interface**, a base class that is **not** an arena class, a **generic** arena class, and `base.M()`
+  (a call to the base's implementation; the subset refuses it for every class). Each is refused with a message saying so.
+* With `--dna`, a family is on one side: if one class of it cannot be lowered, the whole family is managed (`in the inheritance family of managed X`).
+
 ## The corelib
 
 `corelib/src` is C# declarations compiled by Roslyn **instead of** the .NET reference assemblies, so it is the whole
@@ -293,7 +326,7 @@ A member declared without `[Cpp]` is part of .NET that is not implemented yet: u
 | I/O | `Console.Write` / `WriteLine`, `File`, `Directory`, `Path` |
 | other | `Stopwatch`, `Environment.TickCount64` / `NewLine` / `Exit` |
 
-Refused today, with a message: `char`, `null`, `throw` / `try`, lambdas and delegates, generic methods, `is` / `as`,
+Refused today, with a message: `char`, `null`, `throw` / `try`, lambdas and delegates, generic methods (except on arena classes, above), `is` / `as` (except between arena classes),
 LINQ, `goto`, `params`, named arguments, nested types, operators on a class, array initialisers, printing
 a `float` / `double`, and `Dictionary<string, ...>`.
 
@@ -310,9 +343,31 @@ behind `#if !CRUST`.
 `--unity-types` makes the UnityEngine value types part of the program: `Vector2`, `Vector3`, `Quaternion`, `Color`, and the enums `ForceMode2D`, `RigidbodyType2D`
 and `Space`, in namespace `UnityEngine` (`unity/*.cs`, a plain C# source that is added to the inputs). A game says `using UnityEngine;` and carries no copy.
 Their operators are ordinary struct operators, so `a + b`, `-a`, `a * 2f`, `2f * a`, `a == b`, `a += b`, `q * v` become calls of the operator's static method
-(`Vector2::op_Addition(a, b)`), as above; the same file compiled by .NET gives the same numbers. What the subset cannot take (`Equals`, `GetHashCode`, `ToString`,
-the implicit `Vector3` to `Vector2` conversion) is behind `#if !CRUST`. `python3 crust/ccs2c.py Game.cs --unity-types --run`; a test case selects it with a
+(`Vector2::op_Addition(a, b)`), as above; the same file compiled by .NET gives the same numbers. So are the conversions between `Vector2` and `Vector3`: a struct
+may declare `implicit operator` / `explicit operator`, and `Vector3 p = new Vector2(1f, 2f)`, `(Vector3)v` and passing a `Vector2` where a `Vector3` is wanted are calls
+of its `op_Implicit` / `op_Explicit`. What the subset cannot take (`Equals`, `GetHashCode`, `ToString`) is behind `#if !CRUST`. `python3 crust/ccs2c.py Game.cs --unity-types --run`; a test case selects it with a
 `// unity-types` first line (`crust/tests/unity_types.cs`).
+
+### A small Unity engine: `--unity-engine`
+
+`--unity-engine` adds `unity-engine/*.cs` to the program (and `--unity-types`, which it builds on): a small UnityEngine written in the subset, so it lowers to C
+like the rest, and also runs on .NET, so it is tested against it. It is the first slice of an engine that a Unity project's scripts can run on:
+
+| | |
+|---|---|
+| `GameObject`, `Transform`, `Component` | objects are [arena classes](#reference-classes-maxinstancesn): a reference is a pointer, with `null` and `==`; `transform.position` is a property |
+| `MonoBehaviour` | a script is a class that derives from it. Unity finds `Update` by name; there is no reflection here, so the messages (`Awake`, `Start`, `Update`, `LateUpdate`) are `virtual` and a script *overrides* them |
+| `SpriteRenderer`, `Camera`, `Time` | what a 2D frame needs |
+| `Engine` | the scene's objects, `Tick()` (Awake / Start once, then Update, then LateUpdate) and `Find(name)` |
+
+A scene is code: `new GameObject("Hero")`, then `go.Attach(component)` (the packer writes it from the scene file). `crust/tests/unity_engine_scene` is a scene with
+two scripts that is built and run both ways. `GetComponent<T>()` and `AddComponent<T>()` are generic methods of `GameObject` (and `GetComponent<T>()` of `Component`), and
+`crust/tests/unity_engine_components` uses them. `Instantiate` and `Destroy` are methods of `Component` (so a script calls them bare): a prefab is a `Prefab` subclass with a `Create()` that builds the
+GameObject (the packer writes one per prefab), and `Instantiate(template)` calls it. `Destroy` takes effect at the end of the frame and gives the slots back
+(`Arena.Free`, below), so a game can make far more than N objects over its life as long as no more than N are alive at once. Not yet: physics, the rest of Unity.
+
+`--describe=FILE` (compiler) stops after Roslyn has checked the program and writes its classes, bases and public fields with their types as JSON. A tool that writes a
+scene as code asks it which script declares `speed`, and of what type, instead of reading the C# itself.
 
 ## Tests
 
