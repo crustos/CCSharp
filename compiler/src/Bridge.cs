@@ -208,9 +208,8 @@ class BridgePlan
     if (cp.Kind != "class") return "`" + cp.Name + "` is a " + cp.Kind + ": only classes can be held by handle (a struct is copied, which a handle cannot do)";
     if (s.IsGenericType) return "`" + cp.Name + "` is generic";
     if (s.IsStatic) return "`" + cp.Name + "` is a static class";
-    if (s.BaseType != null && s.BaseType.SpecialType != SpecialType.System_Object) return "`" + cp.Name + "` derives from `" + s.BaseType.Name + "`: a class hierarchy cannot cross the boundary yet";
-    if (plan.Order.Any(o => o != cp && o.Sym.BaseType != null && SymbolEqualityComparer.Default.Equals(o.Sym.BaseType.OriginalDefinition, s)))
-      return "`" + cp.Name + "` has derived classes: a class hierarchy cannot cross the boundary yet";
+    string h = InHierarchy(cp);
+    if (h != null) return h;
     if (plan.Order.Any(o => o.Sym.Interfaces.Any(i => SymbolEqualityComparer.Default.Equals(i.OriginalDefinition, s))))
       return "`" + cp.Name + "` is an interface";
     if (s.Interfaces.Any(i => plan.Get(i) != null)) return "`" + cp.Name + "` implements an interface of the program: a class hierarchy cannot cross the boundary yet";
@@ -218,6 +217,16 @@ class BridgePlan
   }
 
   void ProxyArena(ClassPlan cp) { if (!ProxiedArena.Contains(cp)) ProxiedArena.Add(cp); }
+
+  /** null, or why the class is part of a class hierarchy (which cannot cross: a proxy or a handle has no base class). */
+  string InHierarchy(ClassPlan cp)
+  {
+    var s = cp.Sym;
+    if (s.BaseType != null && s.BaseType.SpecialType != SpecialType.System_Object) return "`" + cp.Name + "` derives from `" + s.BaseType.Name + "`: a class hierarchy cannot cross the boundary yet";
+    if (plan.Order.Any(o => o != cp && o.Sym.BaseType != null && SymbolEqualityComparer.Default.Equals(o.Sym.BaseType.OriginalDefinition, s)))
+      return "`" + cp.Name + "` has derived classes: a class hierarchy cannot cross the boundary yet";
+    return null;
+  }
 
   /** The boundary type of `t`, or null with the reason in `why`.  `dir`: which way the call goes; `isResult`: t is the result. */
   BType TypeOf(ITypeSymbol t, Dir dir, bool isResult, out string why)
@@ -302,6 +311,13 @@ class BridgePlan
           + msg.Replace(" (" + r.To.Reason + ")", "").Replace("native class `" + r.From.Name + "` ", "");
         return;
       }
+      //a native class that managed code uses in a way that cannot cross (a struct it holds as a value, a static class, an object whose members
+      //pass what cannot cross) follows the managed class instead, and the native classes that use it then follow it, as above
+      if (r.From.Final == Part.Managed && r.To.Final == Part.Native && !r.To.Shared && r.To.Explicit != Part.Native) {
+        if (!b.Demotable.ContainsKey(r.To)) b.Demotable[r.To] = (r.To.Kind == "struct" ? "a value of it is held by" : "it is used by") + " managed `" + r.From.Name + "` ("
+          + r.File.Substring(r.File.LastIndexOfAny(new[] { '/', '\\' }) + 1) + ":" + r.Line + ")";
+        return;
+      }
       if (reported.Add(text)) b.Errors.Add(text);
     }
     const string WhyStatic = "Native classes (other than arena classes) can be used from managed code through their static methods only; instances of an arena class, and managed instances held by native code, can be used.";
@@ -328,6 +344,9 @@ class BridgePlan
       bool toManaged = r.From.Final == Part.Native && r.To.Final == Part.Managed;
       bool toArena = r.From.Final == Part.Managed && r.To.Final == Part.Native && ArenaClass.Is(r.To.Sym);
       string objWhy = WhyStatic;
+      //an arena class in a hierarchy cannot be proxied (each proxy is a class of its own): it follows the managed class, as Err does
+      string family = toArena && !r.QualifiesStaticCall ? b.InHierarchy(r.To) : null;
+      if (family != null) { Err(r, Who(r) + " uses " + Whom(r) + " as an object: " + family + "."); continue; }
       switch (r.Via) {
         case "type":
           if (r.QualifiesStaticCall) break;
