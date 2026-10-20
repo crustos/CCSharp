@@ -7,6 +7,7 @@
 */
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace CCSharpCompiler;
 
@@ -21,7 +22,7 @@ static class ManagedBuild
       mainTypeName: exe ? mainType : null, allowUnsafe: true, optimizationLevel: OptimizationLevel.Release);
     for (int attempt = 0; attempt < 2; attempt++) {
       errors.Clear();
-      var trees = texts.Select(t => CSharpSyntaxTree.ParseText(t.text, path: t.path)).ToList();
+      var trees = texts.Select(t => MdArrays.Rewrite(CSharpSyntaxTree.ParseText(t.text, Program.ManagedParse, path: t.path))).ToList();
       var comp = CSharpCompilation.Create(Path.GetFileNameWithoutExtension(outPath), trees, new[] { MetadataReference.CreateFromFile(corlibPath) }, options);
       using (var ms = new MemoryStream()) {
         var result = comp.Emit(ms);
@@ -47,5 +48,72 @@ static class ManagedBuild
       }
     }
     return errors;
+  }
+}
+
+/** DotNetAnywhere has no arrays of rank 2 or 3: their types and creations become the corlib's MdArray2 / MdArray3 (an element access, GetLength, Length
+    and foreach read the same).  `T[,] a = { { .. } }` and `new T[,] { { .. } }` become MdArray2<T>.Of(rows); a rank 3 initializer stays (and fails). */
+sealed class MdArrays : CSharpSyntaxRewriter
+{
+  public static SyntaxTree Rewrite(SyntaxTree tree)
+  {
+    if (!tree.GetRoot().DescendantNodes().OfType<ArrayRankSpecifierSyntax>().Any(r => r.Rank > 1)) return tree;
+    var root = new MdArrays().Visit(tree.GetRoot());
+    return tree.WithRootAndOptions(root, tree.Options);
+  }
+
+  static TypeSyntax Md(int rank, TypeSyntax elem)
+  {
+    return SyntaxFactory.ParseTypeName("global::System.Runtime.CompilerServices.MdArray" + rank + "<" + elem.ToString() + ">");
+  }
+
+  /** The type of `specs` (outermost first) over `elem`: each rank-1 specifier an array, each higher one an MdArray. */
+  TypeSyntax Build(TypeSyntax elem, IEnumerable<ArrayRankSpecifierSyntax> specs)
+  {
+    TypeSyntax t = (TypeSyntax)Visit(elem);
+    foreach (var spec in specs.Reverse())
+      t = spec.Rank == 1 ? SyntaxFactory.ArrayType(t, SyntaxFactory.SingletonList(SyntaxFactory.ArrayRankSpecifier(
+            SyntaxFactory.SingletonSeparatedList<ExpressionSyntax>(SyntaxFactory.OmittedArraySizeExpression())))) : Md(spec.Rank, t);
+    return t;
+  }
+
+  public override SyntaxNode VisitArrayType(ArrayTypeSyntax node)
+  {
+    if (node.RankSpecifiers.All(r => r.Rank == 1)) return base.VisitArrayType(node);
+    return Build(node.ElementType, node.RankSpecifiers).WithTriviaFrom(node);
+  }
+
+  ExpressionSyntax Rows(TypeSyntax elem, InitializerExpressionSyntax init)
+  {
+    var e = elem.ToString();
+    var rows = init.Expressions.Select(r => r is InitializerExpressionSyntax ri ? "new " + e + "[] { " + string.Join(", ", ri.Expressions.Select(x => Visit(x).ToString())) + " }" : Visit(r).ToString());
+    return SyntaxFactory.ParseExpression("global::System.Runtime.CompilerServices.MdArray2<" + e + ">.Of(new " + e + "[][] { " + string.Join(", ", rows) + " })");
+  }
+
+  public override SyntaxNode VisitArrayCreationExpression(ArrayCreationExpressionSyntax node)
+  {
+    var specs = node.Type.RankSpecifiers;
+    if (specs.All(r => r.Rank == 1)) return base.VisitArrayCreationExpression(node);
+    var first = specs[0];
+    var elem = Build(node.Type.ElementType, specs.Skip(1));
+    if (first.Rank == 1) {
+      // `new MdArray2<T>[n]`: an array of them
+      var arr = SyntaxFactory.ArrayType(elem, SyntaxFactory.SingletonList((ArrayRankSpecifierSyntax)Visit(first)));
+      return node.WithType(arr).WithInitializer(node.Initializer == null ? null : (InitializerExpressionSyntax)Visit(node.Initializer));
+    }
+    if (node.Initializer != null && first.Rank == 2) return Rows(elem, node.Initializer).WithTriviaFrom(node);
+    var args = first.Sizes.Select(x => SyntaxFactory.Argument((ExpressionSyntax)Visit(x)));
+    return SyntaxFactory.ObjectCreationExpression(Md(first.Rank, elem), SyntaxFactory.ArgumentList(SyntaxFactory.SeparatedList(args)), null).WithTriviaFrom(node);
+  }
+
+  public override SyntaxNode VisitVariableDeclaration(VariableDeclarationSyntax node)
+  {
+    if (node.Type is ArrayTypeSyntax at && at.RankSpecifiers[0].Rank == 2 && node.Variables.Any(v => v.Initializer?.Value is InitializerExpressionSyntax)) {
+      var elem = Build(at.ElementType, at.RankSpecifiers.Skip(1));
+      var vars = node.Variables.Select(v => v.Initializer?.Value is InitializerExpressionSyntax ie
+        ? v.WithInitializer(v.Initializer.WithValue(Rows(elem, ie))) : (VariableDeclaratorSyntax)Visit(v));
+      return node.WithType(((TypeSyntax)Visit(node.Type)).WithTriviaFrom(node.Type)).WithVariables(SyntaxFactory.SeparatedList(vars));
+    }
+    return base.VisitVariableDeclaration(node);
   }
 }
