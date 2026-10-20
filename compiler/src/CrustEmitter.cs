@@ -2014,7 +2014,9 @@ class CrustEmitter
     }
     var parts = new List<object>();
     StringParts(inner, parts);
-    bool concat = inner is InterpolatedStringExpressionSyntax || (inner is BinaryExpressionSyntax)
+    //only `+` is split into parts: any other binary operator producing a string (`a ?? b`) came back from StringParts as one part, which was
+    //appended by building it again here -- forever
+    bool concat = inner is InterpolatedStringExpressionSyntax || (inner is BinaryExpressionSyntax bx && bx.IsKind(SyntaxKind.AddExpression))
                   || (model.GetConstantValue(inner).HasValue);
     RequireHoist(e, "building this string");
     string t = NewTemp("_s");
@@ -2523,6 +2525,8 @@ class CrustEmitter
     var at = (IArrayTypeSymbol)model.GetTypeInfo(ac).Type;
     if (at.Rank > 1) Refuse(ac, "multidimensional arrays are not in the Crust C# subset. Use a jagged array `T[][]`.");
     var elem = at.ElementType;
+    if (elem is ITypeParameterSymbol tpe && ArenaConstrained(tpe))      //`new T[n]` in a generic method on arena classes: the template's T is the class
+      return Ident(tpe.Name) + "::__new_array(" + Expr(ac.Type.RankSpecifiers[0].Sizes[0]) + ")";
     if (IsArena(elem)) {
       TypeName(elem, ac);                                  //(names the class, for its forward declaration)
       return FlatName((INamedTypeSymbol)elem) + "::__new_array(" + Expr(ac.Type.RankSpecifiers[0].Sizes[0]) + ")";
