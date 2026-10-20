@@ -48,6 +48,46 @@ namespace System {
     public static extern string Format(string format, params object[] args);
     public static extern string Concat(string a, string b);
     public static extern bool IsNullOrWhiteSpace(string value);
+
+    // ---- not implemented natively (managed code has them, on DotNetAnywhere) ----
+    public extern string[] Split(params char[] separator);
+    public extern string[] Split(char[] separator, int count);
+    public extern int IndexOf(char value, int startIndex);
+    public extern int IndexOf(char value, int startIndex, int count);
+    public extern int IndexOf(string value, int startIndex);
+    public extern int IndexOf(string value, int startIndex, int count);
+    public extern int IndexOfAny(char[] anyOf);
+    public extern int IndexOfAny(char[] anyOf, int startIndex);
+    public extern int LastIndexOf(char value);
+    public extern int LastIndexOf(char value, int startIndex);
+    public extern int LastIndexOfAny(char[] anyOf);
+    public extern string Remove(int startIndex, int count);
+    public extern string Replace(char oldChar, char newChar);
+    public extern string Trim(params char[] trimChars);
+    public extern string TrimStart(params char[] trimChars);
+    public extern string TrimEnd(params char[] trimChars);
+    public extern string ToLowerInvariant();
+    public extern string ToUpperInvariant();
+    public extern int CompareTo(object value);
+    public static extern int Compare(string strA, string strB);
+    public static extern int CompareOrdinal(string strA, string strB);
+    public static extern bool Equals(string a, string b);
+    public static extern bool Equals(string a, string b, StringComparison comparisonType);
+    public extern bool Equals(string value, StringComparison comparisonType);
+    public extern int IndexOf(string value, StringComparison comparisonType);
+    public extern int IndexOf(string value, int startIndex, StringComparison comparisonType);
+    public extern bool StartsWith(string value, StringComparison comparisonType);
+    public extern bool EndsWith(string value, StringComparison comparisonType);
+    public static extern int Compare(string strA, string strB, bool ignoreCase);
+    public static extern int Compare(string strA, string strB, StringComparison comparisonType);
+    public static extern string Join(string separator, string[] value, int startIndex, int count);
+    public static extern string Concat(string a, string b, string c);
+    public static extern string Concat(string a, string b, string c, string d);
+    public static extern string Concat(params string[] values);
+    public static extern string Concat(object arg0);
+    public static extern string Concat(object arg0, object arg1);
+    public static extern string Concat(object arg0, object arg1, object arg2);
+    public static extern string Concat(params object[] args);
   }
 }
 

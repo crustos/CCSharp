@@ -34,6 +34,7 @@ namespace System {
     [Cpp("cs_acos({0})")]         public static extern double Acos(double a);
     [Cpp("cs_exp({0})")]          public static extern double Exp(double a);
     [Cpp("cs_log({0})")]          public static extern double Log(double a);
+    public static extern double Log10(double a);                                     // not implemented natively (managed code has it)
 
     // Clamp throws ArgumentException when min > max in .NET; here that is a fatal error, like every other unhandled exception.
     [Cpp("cs_clamp_i32({0}, {1}, {2})")] public static extern int Clamp(int value, int min, int max);

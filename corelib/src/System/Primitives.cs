@@ -35,6 +35,7 @@ namespace System {
     public const int MinValue = -2147483648;
     public const int MaxValue = 2147483647;
     [Cpp("cs_i64_str({this})"), CppInclude("\"cs/core.h\"")] public extern string ToString();
+    public extern string ToString(string format);                                  // not implemented natively (managed code has it)
     [Cpp("cs_parse_i32({0})"), CppInclude("\"cs/core.h\"")] public static extern int Parse(string s);
     [Cpp("CsNum::try_parse_i32({0}, {1})"), CppInclude("\"cs/core.h\"")] public static extern bool TryParse(string s, out int result);
   }
@@ -70,6 +71,7 @@ namespace System {
     [Cpp("({0} == -1.0f / 0.0f)")]                   public static extern bool IsNegativeInfinity(float v);
     [Cpp("({0} == 1.0f / 0.0f || {0} == -1.0f / 0.0f)")]      public static extern bool IsInfinity(float v);
     public extern string ToString();
+    public extern string ToString(string format);                                  // not implemented natively (managed code has it)
   }
   public struct Double {
     public const double MinValue = -1.7976931348623157E+308;
@@ -83,6 +85,7 @@ namespace System {
     [Cpp("({0} == -1.0 / 0.0)")]                   public static extern bool IsNegativeInfinity(double v);
     [Cpp("({0} == 1.0 / 0.0 || {0} == -1.0 / 0.0)")]      public static extern bool IsInfinity(double v);
     public extern string ToString();
+    public extern string ToString(string format);                                  // not implemented natively (managed code has it)
   }
 
   // `char` is declared so that code binds, and refused by the emitter: a C# char is UTF-16, a C char is a byte.
