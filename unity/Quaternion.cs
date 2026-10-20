@@ -78,6 +78,63 @@ public struct Quaternion
         return new Quaternion(axis.x * s, axis.y * s, axis.z * s, MathF.Cos(half));
     }
 
+    /// <summary>The shortest rotation that turns direction `from` into direction `to`.</summary>
+    public static Quaternion FromToRotation(Vector3 from, Vector3 to)
+    {
+        float lf = MathF.Sqrt(from.x * from.x + from.y * from.y + from.z * from.z);
+        float lt = MathF.Sqrt(to.x * to.x + to.y * to.y + to.z * to.z);
+        if (lf < 1e-6f || lt < 1e-6f) return new Quaternion(0f, 0f, 0f, 1f);
+        float fx = from.x / lf; float fy = from.y / lf; float fz = from.z / lf;
+        float tx = to.x / lt; float ty = to.y / lt; float tz = to.z / lt;
+        float d = fx * tx + fy * ty + fz * tz;
+        if (d >= 0.999999f) return new Quaternion(0f, 0f, 0f, 1f);
+        if (d <= -0.999999f)
+        {
+            // opposite: half a turn about any axis at right angles to `from`
+            float ax = 0f; float ay = -fz; float az = fy;              // (1,0,0) x f
+            if (ay * ay + az * az < 1e-6f) { ax = fz; ay = 0f; az = -fx; }  // (0,1,0) x f
+            return AngleAxis(180f, new Vector3(ax, ay, az));
+        }
+        float cx = fy * tz - fz * ty; float cy = fz * tx - fx * tz; float cz = fx * ty - fy * tx;
+        float s = MathF.Sqrt((1f + d) * 2f);
+        float inv = 1f / s;
+        return new Quaternion(cx * inv, cy * inv, cz * inv, s * 0.5f);
+    }
+
+    /// <summary>The rotation whose forward (z) is `forward` and whose up is as near `upwards` as it can be.</summary>
+    public static Quaternion LookRotation(Vector3 forward, Vector3 upwards)
+    {
+        float lf = MathF.Sqrt(forward.x * forward.x + forward.y * forward.y + forward.z * forward.z);
+        if (lf < 1e-6f) return new Quaternion(0f, 0f, 0f, 1f);
+        float fx = forward.x / lf; float fy = forward.y / lf; float fz = forward.z / lf;
+        float rx = upwards.y * fz - upwards.z * fy; float ry = upwards.z * fx - upwards.x * fz; float rz = upwards.x * fy - upwards.y * fx;
+        float lr = MathF.Sqrt(rx * rx + ry * ry + rz * rz);
+        if (lr < 1e-6f) return FromToRotation(new Vector3(0f, 0f, 1f), forward);   // forward along upwards: no roll to keep
+        rx = rx / lr; ry = ry / lr; rz = rz / lr;
+        float ux = fy * rz - fz * ry; float uy = fz * rx - fx * rz; float uz = fx * ry - fy * rx;
+        // the rotation matrix's columns are right, up, forward
+        float trace = rx + uy + fz;
+        if (trace > 0f)
+        {
+            float s = MathF.Sqrt(trace + 1f) * 2f;
+            return new Quaternion((uz - fy) / s, (fx - rz) / s, (ry - ux) / s, 0.25f * s);
+        }
+        if (rx > uy && rx > fz)
+        {
+            float s = MathF.Sqrt(1f + rx - uy - fz) * 2f;
+            return new Quaternion(0.25f * s, (ux + ry) / s, (fx + rz) / s, (uz - fy) / s);
+        }
+        if (uy > fz)
+        {
+            float s = MathF.Sqrt(1f + uy - rx - fz) * 2f;
+            return new Quaternion((ux + ry) / s, 0.25f * s, (fy + uz) / s, (fx - rz) / s);
+        }
+        float s2 = MathF.Sqrt(1f + fz - rx - uy) * 2f;
+        return new Quaternion((fx + rz) / s2, (fy + uz) / s2, 0.25f * s2, (ry - ux) / s2);
+    }
+
+    public static Quaternion LookRotation(Vector3 forward) { return LookRotation(forward, new Vector3(0f, 1f, 0f)); }
+
     /// <summary>This rotation as euler angles in degrees, each 0..360 (Unity's order: z, then x, then y).</summary>
     public Vector3 eulerAngles
     {

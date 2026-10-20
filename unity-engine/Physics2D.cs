@@ -42,8 +42,9 @@ public class Rigidbody2D : Component
     public float lastAngVel;
     public bool lastFreeze;
     public bool disabled;               // the backend body is switched off (its object is inactive)
+    public bool simulated;              // false: the body and its colliders are out of the simulation (Unity's Rigidbody2D.simulated)
 
-    public Rigidbody2D() { mass = 1f; gravityScale = 1f; handle = -1; }
+    public Rigidbody2D() { mass = 1f; gravityScale = 1f; handle = -1; simulated = true; }
 
     public override void OnAttach() { Physics2D.bodies.Add(this); }
 
@@ -65,6 +66,30 @@ public class Rigidbody2D : Component
     {
         get { return velocity; }
         set { velocity = value; }
+    }
+
+    public float linearDamping
+    {
+        get { return drag; }
+        set { drag = value; }
+    }
+
+    /// <summary>The owner's position in the plane.</summary>
+    public Vector2 position
+    {
+        get { Vector3 p = transform.position; return new Vector2(p.x, p.y); }
+        set { Vector3 p = transform.position; transform.position = new Vector3(value.x, value.y, p.z); }
+    }
+
+    public void MovePosition(Vector2 p) { position = p; }
+
+    // ponytail: the centre of mass is the body's origin (the shapes' mass distribution is Box2D's alone).  Upgrade path: pb2_world_center.
+    public Vector2 worldCenterOfMass { get { return position; } }
+
+    public bool isKinematic
+    {
+        get { return bodyType == RigidbodyType2D.Kinematic; }
+        set { bodyType = value ? RigidbodyType2D.Kinematic : RigidbodyType2D.Dynamic; }
     }
 
     /// <summary>The z rotation in degrees (Unity's Rigidbody2D.rotation): the owner's.</summary>
@@ -132,12 +157,37 @@ public abstract class Collider2D : Component
     public float sig;                   // a digest of what the shape was made from
     public float staticX;               // where the static body was put
     public float staticY;
+    public int version;                 // counts changes to a polygon's or an edge's points (the backend makes the shape again)
 
     public override void OnAttach() { enabled = true; shape = -1; staticBody = -1; uid = Physics2D.NextUid(); Physics2D.colliders.Add(this); }
+
+#if UNITY_MANAGED
+    PhysicsMaterial2D m_Material;
+
+    /// <summary>The world box around the shape (its rotation and scale taken in).</summary>
+    public Bounds bounds { get { return Shapes2D.BoundsOf(this); } }
+    public Rigidbody2D attachedRigidbody { get { return gameObject.GetComponent<Rigidbody2D>(); } }
+    public PhysicsMaterial2D sharedMaterial
+    {
+        get { return m_Material; }
+        set { m_Material = value; if (value != null) { friction = value.friction; bounciness = value.bounciness; } }
+    }
+    public int Overlap(ContactFilter2D contactFilter, Collider2D[] results) { return Shapes2D.Overlap(this, contactFilter, results, null); }
+    public int Overlap(ContactFilter2D contactFilter, List<Collider2D> results) { return Shapes2D.Overlap(this, contactFilter, null, results); }
+    public int Cast(Vector2 direction, RaycastHit2D[] results, float distance = float.PositiveInfinity) { return Shapes2D.CastCollider(this, direction, ContactFilter2D.Unfiltered(), results, null, distance); }
+    public int Cast(Vector2 direction, ContactFilter2D contactFilter, RaycastHit2D[] results, float distance = float.PositiveInfinity) { return Shapes2D.CastCollider(this, direction, contactFilter, results, null, distance); }
+    public int Cast(Vector2 direction, ContactFilter2D contactFilter, List<RaycastHit2D> results, float distance = float.PositiveInfinity) { return Shapes2D.CastCollider(this, direction, contactFilter, null, results, distance); }
+    public bool IsTouching(Collider2D collider) { return Shapes2D.Touching(this, collider); }
+    public bool IsTouching(ContactFilter2D contactFilter) { return Shapes2D.TouchingAny(this, contactFilter); }
+    public bool IsTouchingLayers(int layerMask = -1) { ContactFilter2D f = ContactFilter2D.Unfiltered(); f.useTriggers = true; f.SetLayerMask(layerMask); return Shapes2D.TouchingAny(this, f); }
+    public bool OverlapPoint(Vector2 point) { return Shapes2D.ContainsPoint(this, point); }
+#endif
 }
 
 public class BoxCollider2D : Collider2D
 {
+    public float edgeRadius;            // rounds the corners (the box grows by it)
+
     public BoxCollider2D() { kind = 0; sizeX = 1f; sizeY = 1f; friction = 0.4f; }
 
     public Vector2 size
@@ -164,6 +214,9 @@ public class PolygonCollider2D : Collider2D
 {
     public List<float> pts;
     public List<int> pieces;
+    public List<float> pathPts;         // the outlines as authored (x, y pairs, without the offset): what points / GetPath give back
+    public List<int> pathLens;
+    public Vector2 pathOffset;          // the authored offset (offset itself is the pieces' box, which the C# backend collides)
     float minX;
     float minY;
     float maxX;
@@ -176,6 +229,25 @@ public class PolygonCollider2D : Collider2D
         friction = 0.4f;
         pts = new List<float>();
         pieces = new List<int>();
+        pathPts = new List<float>();
+        pathLens = new List<int>();
+    }
+
+    /// <summary>A point of an authored outline; EndPath closes it.  (The pieces collide; the outlines are what scripts read.)</summary>
+    public void AddPathPoint(float x, float y)
+    {
+        pathPts.Add(x);
+        pathPts.Add(y);
+    }
+
+    public void EndPath(int count) { pathLens.Add(count); }
+
+    public void ClearPieces()
+    {
+        pts.Clear();
+        pieces.Clear();
+        open = 0;
+        version += 1;
     }
 
     public void AddPoint(float x, float y)
@@ -189,6 +261,63 @@ public class PolygonCollider2D : Collider2D
         pts.Add(y);
         open += 1;
     }
+
+#if UNITY_MANAGED
+    public int pathCount
+    {
+        get { return pathLens.Count; }
+        set
+        {
+            if (value < 0) throw new ArgumentOutOfRangeException("value");
+            List<Vector2[]> keep = new List<Vector2[]>();
+            for (int i = 0; i < value; i++) keep.Add(i < pathLens.Count ? GetPath(i) : new Vector2[0]);
+            SetPaths(keep);
+        }
+    }
+
+    /// <summary>Path 0.</summary>
+    public Vector2[] points { get { return pathLens.Count == 0 ? new Vector2[0] : GetPath(0); } set { SetPath(0, value); } }
+
+    public int GetTotalPointCount() { return pathPts.Count / 2; }
+
+    public Vector2[] GetPath(int index)
+    {
+        if (index < 0 || index >= pathLens.Count) throw new ArgumentOutOfRangeException("index");
+        int at = 0;
+        for (int i = 0; i < index; i++) at += pathLens[i] * 2;
+        Vector2[] r = new Vector2[pathLens[index]];
+        for (int i = 0; i < r.Length; i++) r[i] = new Vector2(pathPts[at + 2 * i], pathPts[at + 2 * i + 1]);
+        return r;
+    }
+
+    public void SetPath(int index, Vector2[] points)
+    {
+        if (index < 0) throw new ArgumentOutOfRangeException("index");
+        List<Vector2[]> all = new List<Vector2[]>();
+        for (int i = 0; i < Math.Max(pathLens.Count, index + 1); i++) all.Add(i == index ? points : i < pathLens.Count ? GetPath(i) : new Vector2[0]);
+        SetPaths(all);
+    }
+
+    public void SetPath(int index, List<Vector2> points) { SetPath(index, points.ToArray()); }
+
+    /// <summary>The outlines again: each cut into triangles for the shapes.</summary>
+    void SetPaths(List<Vector2[]> paths)
+    {
+        pathPts.Clear();
+        pathLens.Clear();
+        ClearPieces();
+        foreach (Vector2[] path in paths)
+        {
+            foreach (Vector2 q in path) AddPathPoint(q.x, q.y);
+            EndPath(path.Length);
+            foreach (Vector2 q in Shapes2D.Triangulate(path))
+            {
+                AddPoint(q.x + pathOffset.x, q.y + pathOffset.y);
+                if (open == 3) EndPiece();
+            }
+        }
+    }
+#endif
 
     public void EndPiece()
     {
@@ -204,6 +333,70 @@ public class PolygonCollider2D : Collider2D
 public class CircleCollider2D : Collider2D
 {
     public CircleCollider2D() { kind = 1; radius = 0.5f; friction = 0.4f; }
+}
+
+/// <summary>An open chain of segments (points in the object's space, without the offset); edgeRadius gives them thickness.  The C# backend collides its box.</summary>
+public class EdgeCollider2D : Collider2D
+{
+    public List<float> pts;
+    public float edgeRadius;
+
+    public EdgeCollider2D()
+    {
+        kind = 4;
+        friction = 0.4f;
+        pts = new List<float>();
+        pts.Add(-0.5f);
+        pts.Add(0f);
+        pts.Add(0.5f);
+        pts.Add(0f);
+        sizeX = 1f;
+    }
+
+    public void ClearPoints() { pts.Clear(); version += 1; }
+
+#if UNITY_MANAGED
+    public int pointCount { get { return pts.Count / 2; } }
+    public int edgeCount { get { return Math.Max(0, pts.Count / 2 - 1); } }
+
+    public Vector2[] points
+    {
+        get
+        {
+            Vector2[] r = new Vector2[pts.Count / 2];
+            for (int i = 0; i < r.Length; i++) r[i] = new Vector2(pts[2 * i], pts[2 * i + 1]);
+            return r;
+        }
+        set
+        {
+            if (value == null || value.Length < 2) throw new ArgumentException("An EdgeCollider2D needs at least two points.");
+            ClearPoints();
+            foreach (Vector2 q in value) AddPoint(q.x, q.y);
+        }
+    }
+
+    public bool SetPoints(List<Vector2> points) { if (points.Count < 2) return false; this.points = points.ToArray(); return true; }
+#endif
+
+    public void AddPoint(float x, float y)
+    {
+        pts.Add(x);
+        pts.Add(y);
+        version += 1;
+        float minX = pts[0];
+        float maxX = pts[0];
+        float minY = pts[1];
+        float maxY = pts[1];
+        for (int i = 2; i < pts.Count; i += 2)
+        {
+            minX = MathF.Min(minX, pts[i]);
+            maxX = MathF.Max(maxX, pts[i]);
+            minY = MathF.Min(minY, pts[i + 1]);
+            maxY = MathF.Max(maxY, pts[i + 1]);
+        }
+        sizeX = maxX - minX + 2f * edgeRadius;
+        sizeY = maxY - minY + 2f * edgeRadius;
+    }
 }
 
 
@@ -277,6 +470,38 @@ public class Collision2D
     public Collider2D otherCollider;    // this object's
     public GameObject gameObject;       // the other object
     public Rigidbody2D rigidbody;       // the other object's body, or null
+
+#if UNITY_MANAGED
+    public Transform transform { get { return gameObject.transform; } }
+    public Rigidbody2D otherRigidbody { get { return otherCollider.attachedRigidbody; } }
+    public int contactCount { get { return 1; } }
+
+    /// <summary>The contact, worked out from the shapes now (the backend reports pairs, not points): its normal points from the other collider to this one.
+    /// ponytail: one contact per pair, at the deepest point.  Upgrade path: Box2D's manifold points through pb2.</summary>
+    public ContactPoint2D GetContact(int index)
+    {
+        if (index != 0) throw new ArgumentOutOfRangeException("index");
+        return Shapes2D.Contact(otherCollider, collider);
+    }
+
+    public int GetContacts(ContactPoint2D[] contacts)
+    {
+        if (contacts.Length == 0) return 0;
+        contacts[0] = GetContact(0);
+        return 1;
+    }
+
+    public Vector2 relativeVelocity
+    {
+        get
+        {
+            Rigidbody2D a = otherRigidbody;
+            Vector2 va = a == null ? Vector2.zero : a.velocity;
+            Vector2 vb = rigidbody == null ? Vector2.zero : rigidbody.velocity;
+            return vb - va;
+        }
+    }
+#endif
 }
 
 public static class Physics2D
@@ -292,6 +517,10 @@ public static class Physics2D
         set { gravityX = value.x; gravityY = value.y; }
     }
     public static float fixedDeltaTime = 0.02f;
+    // Physics2D.IgnoreCollision's pairs (collider uids), and the layer collision matrix (a layer's mask; none set: every layer meets every layer)
+    public static List<int> ignoreA = new List<int>();
+    public static List<int> ignoreB = new List<int>();
+    public static List<int> layerMasks = new List<int>();
     static int uids;
     public static int NextUid() { uids += 1; return uids; }
     /// <summary>An object's z rotation in degrees, from its quaternion.</summary>
@@ -300,6 +529,136 @@ public static class Physics2D
         Quaternion q = t.rotation;
         return 114.59156f * MathF.Atan2(q.z, q.w);
     }
+
+#if UNITY_MANAGED
+    public const int IgnoreRaycastLayer = 4;
+    public const int DefaultRaycastLayers = -5;
+    public const int AllLayers = -1;
+    public static float defaultContactOffset = 0.01f;
+    public static bool queriesHitTriggers = true;
+    public static bool queriesStartInColliders = true;
+    public static bool autoSyncTransforms;
+
+    /// <summary>Queries read the transforms as they are, so there is nothing to push.</summary>
+    public static void SyncTransforms() { }
+
+    public static RaycastHit2D Raycast(Vector2 origin, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                       float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.First(Shapes2D.Ray(origin, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)));
+    }
+    public static int Raycast(Vector2 origin, Vector2 direction, ContactFilter2D contactFilter, RaycastHit2D[] results, float distance = float.PositiveInfinity)
+    {
+        return Shapes2D.Fill(Shapes2D.Ray(origin, direction, distance, contactFilter), results, null);
+    }
+    public static int Raycast(Vector2 origin, Vector2 direction, ContactFilter2D contactFilter, List<RaycastHit2D> results, float distance = float.PositiveInfinity)
+    {
+        return Shapes2D.Fill(Shapes2D.Ray(origin, direction, distance, contactFilter), null, results);
+    }
+    public static RaycastHit2D[] RaycastAll(Vector2 origin, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                            float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.Ray(origin, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)).ToArray();
+    }
+    public static RaycastHit2D Linecast(Vector2 start, Vector2 end, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Raycast(start, end - start, (end - start).magnitude, layerMask, minDepth, maxDepth);
+    }
+    public static int Linecast(Vector2 start, Vector2 end, ContactFilter2D contactFilter, RaycastHit2D[] results)
+    {
+        return Raycast(start, end - start, contactFilter, results, (end - start).magnitude);
+    }
+    public static RaycastHit2D[] LinecastAll(Vector2 start, Vector2 end, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return RaycastAll(start, end - start, (end - start).magnitude, layerMask, minDepth, maxDepth);
+    }
+    public static RaycastHit2D BoxCast(Vector2 origin, Vector2 size, float angle, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                       float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.First(Shapes2D.Sweep(Shapes2D.Box(origin, size, angle), null, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)));
+    }
+    public static int BoxCast(Vector2 origin, Vector2 size, float angle, Vector2 direction, ContactFilter2D contactFilter, RaycastHit2D[] results, float distance = float.PositiveInfinity)
+    {
+        return Shapes2D.Fill(Shapes2D.Sweep(Shapes2D.Box(origin, size, angle), null, direction, distance, contactFilter), results, null);
+    }
+    public static RaycastHit2D[] BoxCastAll(Vector2 origin, Vector2 size, float angle, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                            float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.Sweep(Shapes2D.Box(origin, size, angle), null, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)).ToArray();
+    }
+    public static RaycastHit2D CircleCast(Vector2 origin, float radius, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                          float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.First(Shapes2D.Sweep(Shapes2D.Circle(origin, radius), null, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)));
+    }
+    public static RaycastHit2D[] CircleCastAll(Vector2 origin, float radius, Vector2 direction, float distance = float.PositiveInfinity, int layerMask = DefaultRaycastLayers,
+                                               float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.Sweep(Shapes2D.Circle(origin, radius), null, direction, distance, ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)).ToArray();
+    }
+    public static Collider2D OverlapPoint(Vector2 point, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        List<Collider2D> all = Shapes2D.OverlapShape(Shapes2D.Circle(point, 0f), ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth));
+        return all.Count == 0 ? null : all[0];
+    }
+    public static Collider2D OverlapCircle(Vector2 point, float radius, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        List<Collider2D> all = Shapes2D.OverlapShape(Shapes2D.Circle(point, radius), ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth));
+        return all.Count == 0 ? null : all[0];
+    }
+    public static Collider2D[] OverlapCircleAll(Vector2 point, float radius, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.OverlapShape(Shapes2D.Circle(point, radius), ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)).ToArray();
+    }
+    public static int OverlapCircle(Vector2 point, float radius, ContactFilter2D contactFilter, Collider2D[] results)
+    {
+        return Shapes2D.Fill(Shapes2D.OverlapShape(Shapes2D.Circle(point, radius), contactFilter), results);
+    }
+    public static Collider2D OverlapBox(Vector2 point, Vector2 size, float angle, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        List<Collider2D> all = Shapes2D.OverlapShape(Shapes2D.Box(point, size, angle), ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth));
+        return all.Count == 0 ? null : all[0];
+    }
+    public static Collider2D[] OverlapBoxAll(Vector2 point, Vector2 size, float angle, int layerMask = DefaultRaycastLayers, float minDepth = float.NegativeInfinity, float maxDepth = float.PositiveInfinity)
+    {
+        return Shapes2D.OverlapShape(Shapes2D.Box(point, size, angle), ContactFilter2D.FromLayers(layerMask, minDepth, maxDepth)).ToArray();
+    }
+    public static int OverlapBox(Vector2 point, Vector2 size, float angle, ContactFilter2D contactFilter, Collider2D[] results)
+    {
+        return Shapes2D.Fill(Shapes2D.OverlapShape(Shapes2D.Box(point, size, angle), contactFilter), results);
+    }
+
+    public static void IgnoreCollision(Collider2D collider1, Collider2D collider2, bool ignore = true)
+    {
+        for (int i = ignoreA.Count - 1; i >= 0; i--)
+        {
+            if ((ignoreA[i] == collider1.uid && ignoreB[i] == collider2.uid) || (ignoreA[i] == collider2.uid && ignoreB[i] == collider1.uid)) { ignoreA.RemoveAt(i); ignoreB.RemoveAt(i); }
+        }
+        if (ignore) { ignoreA.Add(collider1.uid); ignoreB.Add(collider2.uid); }
+    }
+    public static bool GetIgnoreCollision(Collider2D collider1, Collider2D collider2)
+    {
+        for (int i = 0; i < ignoreA.Count; i++)
+        {
+            if ((ignoreA[i] == collider1.uid && ignoreB[i] == collider2.uid) || (ignoreA[i] == collider2.uid && ignoreB[i] == collider1.uid)) return true;
+        }
+        return false;
+    }
+    public static int GetLayerCollisionMask(int layer) { return LayerMaskOf(layer); }
+    public static void SetLayerCollisionMask(int layer, int layerMask)
+    {
+        if (layer < 0 || layer > 31) throw new ArgumentOutOfRangeException("layer");
+        while (layerMasks.Count < 32) layerMasks.Add(-1);
+        layerMasks[layer] = layerMask;
+    }
+    public static void IgnoreLayerCollision(int layer1, int layer2, bool ignore = true)
+    {
+        int m1 = LayerMaskOf(layer1), m2 = LayerMaskOf(layer2);
+        SetLayerCollisionMask(layer1, ignore ? m1 & ~(1 << layer2) : m1 | (1 << layer2));
+        SetLayerCollisionMask(layer2, ignore ? m2 & ~(1 << layer1) : m2 | (1 << layer1));
+    }
+    public static bool GetIgnoreLayerCollision(int layer1, int layer2) { return (LayerMaskOf(layer1) & (1 << layer2)) == 0; }
+#endif
 
     public static Collider2D ByUid(int uid)
     {
@@ -372,7 +731,26 @@ public static class Physics2D
 
     public static bool Active(Collider2D c)
     {
-        return c.enabled && c.gameObject.activeSelf && !c.destroyed;
+        Rigidbody2D rb = c.gameObject.GetComponent<Rigidbody2D>();
+        if (rb != null && !rb.simulated) return false;
+        return c.enabled && c.gameObject.activeInHierarchy && !c.destroyed;
+    }
+
+    public static int LayerMaskOf(int layer)
+    {
+        if (layer < 0 || layer >= layerMasks.Count) return -1;
+        return layerMasks[layer];
+    }
+
+    /// <summary>May a and b touch: not an ignored pair, and their layers meet in the matrix.</summary>
+    public static bool Collides(Collider2D a, Collider2D b)
+    {
+        if ((LayerMaskOf(a.gameObject.layer) & (1 << b.gameObject.layer)) == 0) return false;
+        for (int i = 0; i < ignoreA.Count; i++)
+        {
+            if ((ignoreA[i] == a.uid && ignoreB[i] == b.uid) || (ignoreA[i] == b.uid && ignoreB[i] == a.uid)) return false;
+        }
+        return true;
     }
 
     /// <summary>One step: forces and gravity, movement, then the contacts and their messages.</summary>
@@ -397,6 +775,12 @@ public static class Physics2D
     static void Messages()
     {
         if (scratch == null) scratch = new Collision2D();
+        for (int i = curA.Count - 1; i >= 0; i--)
+        {
+            // ponytail: an ignored pair (IgnoreCollision, the layer matrix) gets no messages and the C# backend does not push it apart; Box2D
+            // still does (pb2 has no contact filter).  Upgrade path: a b2ShapeDef filter category / mask per collider and a custom filter.
+            if (!Collides(curA[i], curB[i])) { curA.RemoveAt(i); curB.RemoveAt(i); curT.RemoveAt(i); }
+        }
         for (int i = 0; i < curA.Count; i++)
         {
             bool known = Held(prevA, prevB, prevT, curA[i], curB[i]);
@@ -436,6 +820,18 @@ public static class Physics2D
         {
             MonoBehaviour m = g.components[i] as MonoBehaviour;
             if (m == null || !m.enabled) continue;
+#if UNITY_MANAGED
+            try { Message(m, trigger, phase, other); }
+            catch (Exception e) { Debug.LogException(e, m); }     // as Unity: logged, and the other scripts still get theirs
+#else
+            Message(m, trigger, phase, other);
+#endif
+        }
+    }
+
+    static void Message(MonoBehaviour m, bool trigger, int phase, Collider2D other)
+    {
+        {
             if (trigger)
             {
                 if (phase == 0) m.OnTriggerEnter2D(other);
