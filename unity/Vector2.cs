@@ -206,6 +206,8 @@ public struct Vector2
     public static Vector2 operator *(Vector2 a, float d) { return new Vector2(a.x * d, a.y * d); }
     public static Vector2 operator *(float d, Vector2 a) { return new Vector2(a.x * d, a.y * d); }
     public static Vector2 operator /(Vector2 a, float d) { return new Vector2(a.x / d, a.y / d); }
+    public static Vector2 operator *(Vector2 a, Vector2 b) { return new Vector2(a.x * b.x, a.y * b.y); }
+    public static Vector2 operator /(Vector2 a, Vector2 b) { return new Vector2(a.x / b.x, a.y / b.y); }
     public static bool operator ==(Vector2 lhs, Vector2 rhs)
     {
         float dx = lhs.x - rhs.x;

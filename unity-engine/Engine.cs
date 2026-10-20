@@ -132,15 +132,133 @@ public class Transform : Component
     public Vector3 localPosition;
     public Vector3 localScale;
     public Quaternion localRotation;
-    public Transform parent;
+    Transform parentTransform;
+    List<Transform> children;
+
+    public Transform() { children = new List<Transform>(); }
+
+    /// <summary>Setting it keeps the world position, rotation and scale, as Unity's does (SetParent(p, false) keeps the local ones).</summary>
+    public Transform parent
+    {
+        get { return parentTransform; }
+        set { SetParent(value, true); }
+    }
+
+    public Transform root
+    {
+        get
+        {
+            Transform t = this;
+            while (t.parentTransform != null) t = t.parentTransform;
+            return t;
+        }
+    }
+
+    public int childCount { get { return children.Count; } }
+
+    public Transform GetChild(int index) { return children[index]; }
+
+    public void SetParent(Transform p) { SetParent(p, true); }
+
+    public void SetParent(Transform p, bool worldPositionStays)
+    {
+        if (p == parentTransform) return;
+        Vector3 wp = position;
+        Quaternion wr = rotation;
+        Vector3 ws = lossyScale;
+        bool was = gameObject.activeInHierarchy;
+        if (parentTransform != null) parentTransform.RemoveChild(this);
+        parentTransform = p;
+        if (p != null) p.children.Add(this);
+        if (worldPositionStays)
+        {
+            rotation = wr;
+            position = wp;
+            if (p == null) localScale = ws;
+            else
+            {
+                Vector3 ps = p.lossyScale;
+                localScale = new Vector3(ps.x == 0f ? ws.x : ws.x / ps.x, ps.y == 0f ? ws.y : ws.y / ps.y, ps.z == 0f ? ws.z : ws.z / ps.z);
+            }
+        }
+        bool now = gameObject.activeInHierarchy;
+        if (was != now) Engine.ActivityChanged(gameObject, now);
+    }
+
+    void RemoveChild(Transform c)
+    {
+        for (int i = 0; i < children.Count; i++)
+        {
+            if (children[i] == c) { children.RemoveAt(i); return; }
+        }
+    }
+
+    /// <summary>Its place among its parent's children (or among the scene's root objects).</summary>
+    public int GetSiblingIndex()
+    {
+        if (parentTransform == null) return Engine.RootIndex(gameObject);
+        for (int i = 0; i < parentTransform.children.Count; i++)
+        {
+            if (parentTransform.children[i] == this) return i;
+        }
+        return 0;
+    }
+
+    public void SetSiblingIndex(int index)
+    {
+        if (parentTransform == null) return;
+        parentTransform.RemoveChild(this);
+        if (index < 0) index = 0;
+        if (index > parentTransform.children.Count) index = parentTransform.children.Count;
+        parentTransform.children.Insert(index, this);
+    }
+
+    public void SetAsFirstSibling() { SetSiblingIndex(0); }
+
+    public void SetAsLastSibling() { if (parentTransform != null) SetSiblingIndex(parentTransform.children.Count); }
+
+    public void DetachChildren()
+    {
+        while (children.Count > 0) children[children.Count - 1].SetParent(null, true);
+    }
+
+    /// <summary>The child of that name, or a descendant by path ("a/b").</summary>
+    public Transform Find(string n)
+    {
+        int slash = n.IndexOf("/");
+        string first = n;
+        if (slash >= 0) first = n.Substring(0, slash);
+        for (int i = 0; i < children.Count; i++)
+        {
+            Transform c = children[i];
+            if (c.gameObject.name == first)
+            {
+                if (slash < 0) return c;
+                Transform deeper = c.Find(n.Substring(slash + 1));
+                if (deeper != null) return deeper;
+            }
+        }
+        return null;
+    }
+
+    public bool IsChildOf(Transform p)
+    {
+        Transform t = this;
+        while (t != null)
+        {
+            if (t == p) return true;
+            t = t.parentTransform;
+        }
+        return false;
+    }
 
     /// <summary>The scale in the world: the parents' scales multiplied in (not a shear: a rotated parent with a non-uniform scale is approximated).</summary>
     public Vector3 lossyScale
     {
         get
         {
-            if (parent == null) return localScale;
-            Vector3 ps = parent.lossyScale;
+            if (parentTransform == null) return localScale;
+            Vector3 ps = parentTransform.lossyScale;
             return new Vector3(ps.x * localScale.x, ps.y * localScale.y, ps.z * localScale.z);
         }
     }
@@ -149,19 +267,50 @@ public class Transform : Component
     {
         get
         {
-            if (parent == null) return localRotation;
-            Quaternion pr = parent.rotation;
+            if (parentTransform == null) return localRotation;
+            Quaternion pr = parentTransform.rotation;
             return pr * localRotation;
         }
         set
         {
-            if (parent == null) localRotation = value;
+            if (parentTransform == null) localRotation = value;
             else
             {
-                Quaternion inv = Quaternion.Inverse(parent.rotation);
+                Quaternion inv = Quaternion.Inverse(parentTransform.rotation);
                 localRotation = inv * value;
             }
         }
+    }
+
+    public Vector3 eulerAngles
+    {
+        get { return rotation.eulerAngles; }
+        set { rotation = Quaternion.Euler(value); }
+    }
+
+    public Vector3 localEulerAngles
+    {
+        get { return localRotation.eulerAngles; }
+        set { localRotation = Quaternion.Euler(value); }
+    }
+
+    /// <summary>The local axes in the world.  Setting one turns the transform the shortest way to it.</summary>
+    public Vector3 right
+    {
+        get { Quaternion q = rotation; return q * new Vector3(1f, 0f, 0f); }
+        set { rotation = Quaternion.FromToRotation(new Vector3(1f, 0f, 0f), value); }
+    }
+
+    public Vector3 up
+    {
+        get { Quaternion q = rotation; return q * new Vector3(0f, 1f, 0f); }
+        set { rotation = Quaternion.FromToRotation(new Vector3(0f, 1f, 0f), value); }
+    }
+
+    public Vector3 forward
+    {
+        get { Quaternion q = rotation; return q * new Vector3(0f, 0f, 1f); }
+        set { rotation = Quaternion.LookRotation(value); }
     }
 
     /// <summary>A point of this transform's space in the world.</summary>
@@ -175,34 +324,64 @@ public class Transform : Component
         return origin + r;
     }
 
+    /// <summary>A world point in this transform's space.</summary>
+    public Vector3 InverseTransformPoint(Vector3 p)
+    {
+        Vector3 rel = p - position;
+        Vector3 d = Quaternion.Inverse(rotation) * rel;
+        Vector3 s = lossyScale;
+        return new Vector3(s.x == 0f ? 0f : d.x / s.x, s.y == 0f ? 0f : d.y / s.y, s.z == 0f ? 0f : d.z / s.z);
+    }
+
+    /// <summary>A direction turned into the world (not scaled).</summary>
+    public Vector3 TransformDirection(Vector3 d) { return rotation * d; }
+
+    public Vector3 InverseTransformDirection(Vector3 d) { return Quaternion.Inverse(rotation) * d; }
+
+    /// <summary>A vector turned and scaled into the world (not moved).</summary>
+    public Vector3 TransformVector(Vector3 v)
+    {
+        Vector3 s = lossyScale;
+        Quaternion q = rotation;
+        return q * new Vector3(v.x * s.x, v.y * s.y, v.z * s.z);
+    }
+
+    public Vector3 InverseTransformVector(Vector3 v)
+    {
+        Vector3 d = Quaternion.Inverse(rotation) * v;
+        Vector3 s = lossyScale;
+        return new Vector3(s.x == 0f ? 0f : d.x / s.x, s.y == 0f ? 0f : d.y / s.y, s.z == 0f ? 0f : d.z / s.z);
+    }
+
     /// <summary>The world position: the parents' scale, rotation and position applied to the local one.</summary>
     public Vector3 position
     {
         get
         {
-            if (parent == null) return localPosition;
-            return parent.TransformPoint(localPosition);
+            if (parentTransform == null) return localPosition;
+            return parentTransform.TransformPoint(localPosition);
         }
         set
         {
-            if (parent == null)
+            if (parentTransform == null)
             {
                 localPosition = value;
                 return;
             }
-            Quaternion inv = Quaternion.Inverse(parent.rotation);
-            Vector3 rel = value - parent.position;
-            Vector3 d = inv * rel;
-            Vector3 s = parent.lossyScale;
-            float sx = s.x; float sy = s.y; float sz = s.z;
-            if (sx == 0f) sx = 1f;
-            if (sy == 0f) sy = 1f;
-            if (sz == 0f) sz = 1f;
-            localPosition = new Vector3(d.x / sx, d.y / sy, d.z / sz);
+            localPosition = parentTransform.InverseTransformPoint(value);
         }
     }
 
     public void Translate(Vector3 delta) { position = position + delta; }
+
+    /// <summary>Turns by euler angles in degrees, about the local axes.</summary>
+    public void Rotate(Vector3 eulers)
+    {
+        Quaternion cur = localRotation;
+        localRotation = cur * Quaternion.Euler(eulers);
+    }
+
+    public void Rotate(float xAngle, float yAngle, float zAngle) { Rotate(new Vector3(xAngle, yAngle, zAngle)); }
 
     /// <summary>Turns about the z axis, in degrees (the 2D rotation).</summary>
     public void RotateZ(float degrees)
@@ -211,6 +390,77 @@ public class Transform : Component
         Quaternion cur = localRotation;
         localRotation = cur * turn;
     }
+
+    public void LookAt(Vector3 worldPosition)
+    {
+        Vector3 d = worldPosition - position;
+        if (d.x != 0f || d.y != 0f || d.z != 0f) rotation = Quaternion.LookRotation(d);
+    }
+
+#if UNITY_MANAGED
+    public void LookAt(Transform target) { LookAt(target.position); }
+
+    public void Translate(Vector3 translation, Space relativeTo)
+    {
+        if (relativeTo == Space.World) position = position + translation;
+        else position = position + TransformDirection(translation);
+    }
+
+    public void Translate(float x, float y, float z) { Translate(new Vector3(x, y, z)); }
+
+    public void Rotate(Vector3 eulers, Space relativeTo)
+    {
+        Quaternion q = Quaternion.Euler(eulers);
+        if (relativeTo == Space.Self) localRotation = localRotation * q;
+        else rotation = q * rotation;
+    }
+
+    /// <summary>Turns `angle` degrees about `axis` (local axes: Space.Self).</summary>
+    public void Rotate(Vector3 axis, float angle) { Rotate(axis, angle, Space.Self); }
+
+    public void Rotate(Vector3 axis, float angle, Space relativeTo)
+    {
+        if (relativeTo == Space.Self) rotation = rotation * Quaternion.AngleAxis(angle, axis);
+        else rotation = Quaternion.AngleAxis(angle, axis) * rotation;
+    }
+
+    public void RotateAround(Vector3 point, Vector3 axis, float angle)
+    {
+        Quaternion q = Quaternion.AngleAxis(angle, axis);
+        position = point + q * (position - point);
+        rotation = q * rotation;
+    }
+
+    public void SetPositionAndRotation(Vector3 p, Quaternion r) { position = p; rotation = r; }
+
+    public Matrix4x4 localToWorldMatrix { get { return Matrix4x4.TRS(position, rotation, lossyScale); } }
+    public Matrix4x4 worldToLocalMatrix { get { return localToWorldMatrix.inverse; } }
+
+    /// <summary>Its children, as `foreach (Transform child in transform)` gives them.</summary>
+    public System.Collections.IEnumerator GetEnumerator() { return new List<Transform>(children).GetEnumerator(); }
+#endif
+}
+
+/// <summary>A component that can be turned off (its `enabled`).</summary>
+public abstract class Behaviour : Component
+{
+    bool isEnabled = true;
+
+    public bool enabled
+    {
+        get { return isEnabled; }
+        set
+        {
+            if (value == isEnabled) return;
+            isEnabled = value;
+            OnEnabledChanged(value);
+        }
+    }
+
+    public bool isActiveAndEnabled { get { return isEnabled && gameObject.activeInHierarchy; } }
+
+    /// <summary>What a kind of behaviour does when enabled changes (a script gets OnEnable / OnDisable).</summary>
+    public virtual void OnEnabledChanged(bool value) { }
 }
 
 /// <summary>A script.  Unity finds its messages by name; here they are virtual, and the packer writes `override` on the ones a script declares.</summary>
