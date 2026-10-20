@@ -179,6 +179,9 @@ namespace CCSharpCompiler;
         if (arg == "--srclist" && value.Length > 0) {
           srcListPath = value;
         }
+        if (arg == "--define" && value.Length > 0) {
+          defines.Add(value);
+        }
         if (arg == "--corelib" && value.Length > 0) {
           corelibPath = value.Replace("\\", "/");
         }
@@ -552,20 +555,38 @@ namespace CCSharpCompiler;
       var sb = new StringBuilder("{\n");
       bool firstClass = true;
       foreach (Source node in files) {
-        foreach (var cd in node.tree.GetRoot().DescendantNodes().OfType<ClassDeclarationSyntax>()) {
+        // classes, structs and enums: a scene sets their fields, and stores an enum as its number
+        foreach (var cd in node.tree.GetRoot().DescendantNodes().Where(n => n is ClassDeclarationSyntax || n is StructDeclarationSyntax || n is EnumDeclarationSyntax)) {
           var sym = node.model.GetDeclaredSymbol(cd) as INamedTypeSymbol;
           if (sym == null) continue;
-          if (!firstClass) sb.Append(",\n");
-          firstClass = false;
-          sb.Append("  \"" + sym.Name + "\": {\"base\": " + (sym.BaseType != null && sym.BaseType.SpecialType == SpecialType.None ? "\"" + sym.BaseType.Name + "\"" : "null") + ", \"fields\": {");
+          string kind = sym.TypeKind == TypeKind.Enum ? "enum" : sym.TypeKind == TypeKind.Struct ? "struct" : "class";
+          // can it be made with `new T()`: no constructor written, or a public one without parameters
+          bool newable = kind != "class" || !sym.InstanceConstructors.Any(c => !c.IsImplicitlyDeclared) ||
+                         sym.InstanceConstructors.Any(c => c.Parameters.Length == 0 && c.DeclaredAccessibility == Accessibility.Public);
+          var entry = new StringBuilder("{\"kind\": \"" + kind + "\", \"new\": " + (newable && !sym.IsAbstract ? "true" : "false") + ", \"base\": " + (kind == "class" && sym.BaseType != null && sym.BaseType.SpecialType == SpecialType.None ? "\"" + sym.BaseType.Name + "\"" : "null") + ", \"fields\": {");
           bool firstField = true;
-          foreach (var f in sym.GetMembers().OfType<IFieldSymbol>()) {
-            if (f.IsStatic || f.IsConst || f.DeclaredAccessibility != Accessibility.Public || f.IsImplicitlyDeclared) continue;
-            if (!firstField) sb.Append(", ");
-            firstField = false;
-            sb.Append("\"" + f.Name + "\": \"" + f.Type.ToDisplayString() + "\"");
+          var seenFields = new HashSet<string>();
+          // its own fields, then those it inherits from the program's classes, typed as the base it names has them (`SingletonMonoBehaviour<Game>`'s
+          // `T instance` is a `Game`); the engine's own classes (UnityEngine, TMPro) are not walked
+          for (var t = sym; t != null && t.SpecialType != SpecialType.System_Object; t = t.BaseType) {
+            string ns = t.ContainingNamespace?.ToDisplayString() ?? "";
+            if (t != sym && (ns == "UnityEngine" || ns.StartsWith("UnityEngine.") || ns == "TMPro" || ns.StartsWith("System"))) break;
+            foreach (var f in t.GetMembers().OfType<IFieldSymbol>()) {
+              if (kind == "enum" || f.IsStatic || f.IsConst || f.DeclaredAccessibility != Accessibility.Public || f.IsImplicitlyDeclared) continue;
+              if (!seenFields.Add(f.Name)) continue;
+              if (!firstField) entry.Append(", ");
+              firstField = false;
+              entry.Append("\"" + f.Name + "\": \"" + f.Type.ToDisplayString() + "\"");
+            }
           }
-          sb.Append("}}");
+          entry.Append("}}");
+          // by its name and, when that differs, by its full name (as a field's type is written): two classes of one name stay apart there
+          var full = sym.ToDisplayString();
+          foreach (var key in full == sym.Name ? new[] { sym.Name } : new[] { sym.Name, full }) {
+            if (!firstClass) sb.Append(",\n");
+            firstClass = false;
+            sb.Append("  \"" + key + "\": " + entry);
+          }
         }
       }
       sb.Append("\n}\n");
@@ -661,7 +682,11 @@ namespace CCSharpCompiler;
 
     /** The program is parsed with CRUST defined, as csrust and cs2cpp do: a library keeps what the subset cannot take (a debug ToString, a LINQ
         dump) behind `#if !CRUST`.  The managed half of a --dna build is parsed without it: that code runs on a full runtime. */
-    static readonly CSharpParseOptions CrustParse = CSharpParseOptions.Default.WithPreprocessorSymbols("CRUST");
+    static CSharpParseOptions CrustParse { get { return CSharpParseOptions.Default.WithPreprocessorSymbols(new[] { "CRUST" }.Concat(defines)); } }
+
+    /** --define=SYMBOL: defined for both halves (CRUST is the native half's alone). */
+    public static List<string> defines = new List<string>();
+    public static CSharpParseOptions ManagedParse { get { return CSharpParseOptions.Default.WithPreprocessorSymbols(defines); } }
 
     List<Source> CrustOrder(List<Source> list)
     {

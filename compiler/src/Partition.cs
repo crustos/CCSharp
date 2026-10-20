@@ -412,7 +412,7 @@ class PartitionPlan
     var used = new HashSet<string>();
     foreach (var f in files) {
       string sliced = SliceText(f.tree, f.model);
-      if (!HasMembers(CSharpSyntaxTree.ParseText(sliced).GetRoot())) continue;
+      if (!HasMembers(CSharpSyntaxTree.ParseText(sliced, Program.ManagedParse).GetRoot())) continue;
       string name = Path.GetFileNameWithoutExtension(f.file);
       string unique = name; int k = 2;
       while (!used.Add(unique)) unique = name + (k++);
