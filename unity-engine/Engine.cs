@@ -905,28 +905,164 @@ public abstract class MonoBehaviour : Behaviour
 #endif
 }
 
-public class SpriteRenderer : Component
+/// <summary>What draws: whether it does, and where it sorts.  (Each kind sets enabled when attached: the subset has no base.M() call.)</summary>
+public abstract class Renderer : Component
 {
     public bool enabled;
+    public int sortingOrder;
+    public int sortingLayer;            // the index of the sorting layer in the project's list
+
+#if UNITY_MANAGED
+    Material m_Material;
+
+    public Material sharedMaterial
+    {
+        get { if (m_Material == null) m_Material = new Material(Shader.Find("Sprites/Default")); return m_Material; }
+        set { m_Material = value; }
+    }
+    public Material material { get { return sharedMaterial; } set { sharedMaterial = value; } }
+    public Material[] sharedMaterials { get { return new Material[] { sharedMaterial }; } set { m_Material = value != null && value.Length > 0 ? value[0] : null; } }
+    public Material[] materials { get { return sharedMaterials; } set { sharedMaterials = value; } }
+    public bool isVisible { get { return enabled && gameObject.activeInHierarchy; } }
+    public virtual Bounds bounds { get { return new Bounds(transform.position, Vector3.zero); } }
+    public Bounds localBounds { get { Bounds b = bounds; b.center = transform.InverseTransformPoint(b.center); return b; } }
+    public UnityEngine.Rendering.ShadowCastingMode shadowCastingMode;
+    public bool receiveShadows;
+    public MotionVectorGenerationMode motionVectorGenerationMode;
+    public uint renderingLayerMask = 1;
+    public int rendererPriority;
+
+    public int sortingLayerID { get { return SortingLayer.IndexToID(sortingLayer); } set { sortingLayer = SortingLayer.IDToIndex(value); } }
+    public string sortingLayerName { get { return SortingLayer.IDToName(sortingLayerID); } set { sortingLayer = SortingLayer.IDToIndex(SortingLayer.NameToID(value)); } }
+#endif
+}
+
+public class SpriteRenderer : Renderer
+{
     public int spriteId;                // the host's texture index
     public float halfW, halfH;          // the sprite's half size in world units at scale 1; the draw multiplies in the transform's scale
     public Color color;
-    public int sortingOrder;
-    public int sortingLayer;            // the index of the sorting layer in the project's list
+    public bool flipX;
+    public bool flipY;
 
     public override void OnAttach()
     {
         enabled = true;
         Engine.sprites.Add(this);
     }
+
+#if UNITY_MANAGED
+    Sprite m_Sprite;
+
+    /// <summary>The sprite drawn: setting it draws its texture (the host's) at its size.</summary>
+    public Sprite sprite
+    {
+        get { return m_Sprite; }
+        set
+        {
+            m_Sprite = value;
+            if (value == null) { spriteId = -1; return; }
+            spriteId = value.texture != null ? value.texture.hostId : -1;
+            halfW = value.rect.width / value.pixelsPerUnit / 2f;
+            halfH = value.rect.height / value.pixelsPerUnit / 2f;
+        }
+    }
+
+    public Vector2 size { get { return new Vector2(halfW * 2f, halfH * 2f); } set { halfW = value.x / 2f; halfH = value.y / 2f; } }
+    public SpriteDrawMode drawMode;
+    public SpriteMaskInteraction maskInteraction;
+    public SpriteSortPoint spriteSortPoint;
+
+    /// <summary>The drawn rectangle in the world (its scale and the sprite's pivot taken in).</summary>
+    public override Bounds bounds
+    {
+        get
+        {
+            Vector3 s = transform.lossyScale;
+            Vector3 center = transform.position;
+            if (m_Sprite != null) center = transform.TransformPoint(m_Sprite.bounds.center);
+            return new Bounds(center, new Vector3(halfW * 2f * Mathf.Abs(s.x), halfH * 2f * Mathf.Abs(s.y), 0f));
+        }
+    }
+#endif
 }
 
 public class Camera : Component
 {
+    public bool enabled = true;
+    float aspectOverride;
+    public bool orthographic = true;
     public float orthographicSize;
     public Color background;
+    public float nearClipPlane = 0.3f;
+    public float farClipPlane = 1000f;
 
     public override void OnAttach() { Engine.mainCamera = this; }
+
+    /// <summary>The scene's camera (the one the host draws with).</summary>
+    public static Camera main { get { return Engine.mainCamera; } }
+
+    public Color backgroundColor
+    {
+        get { return background; }
+        set { background = value; }
+    }
+
+    /// <summary>The window's width over its height (unless set; ResetAspect goes back to the window's).</summary>
+    public float aspect
+    {
+        get
+        {
+            if (aspectOverride > 0f) return aspectOverride;
+            return Screen.height == 0 ? 1f : (float)Screen.width / (float)Screen.height;
+        }
+        set { aspectOverride = value; }
+    }
+
+    public void ResetAspect() { aspectOverride = 0f; }
+
+    public int pixelWidth { get { return Screen.width; } }
+    public int pixelHeight { get { return Screen.height; } }
+
+    /// <summary>A point of the window (pixels from the bottom left; z is the distance from the camera) in the world.  Orthographic.</summary>
+    public Vector3 ScreenToWorldPoint(Vector3 p)
+    {
+        return ViewportToWorldPoint(new Vector3(p.x / (float)Screen.width, p.y / (float)Screen.height, p.z));
+    }
+
+    /// <summary>A point of the view (0..1 across, 0..1 up) in the world.  Orthographic.</summary>
+    public Vector3 ViewportToWorldPoint(Vector3 v)
+    {
+        Vector3 c = transform.position;
+        float h = orthographicSize;
+        float w = h * aspect;
+        return new Vector3(c.x + (v.x * 2f - 1f) * w, c.y + (v.y * 2f - 1f) * h, c.z + v.z);
+    }
+
+    public Vector3 WorldToViewportPoint(Vector3 p)
+    {
+        Vector3 c = transform.position;
+        float h = orthographicSize;
+        float w = h * aspect;
+        return new Vector3(((p.x - c.x) / w + 1f) * 0.5f, ((p.y - c.y) / h + 1f) * 0.5f, p.z - c.z);
+    }
+
+    public Vector3 WorldToScreenPoint(Vector3 p)
+    {
+        Vector3 v = WorldToViewportPoint(p);
+        return new Vector3(v.x * (float)Screen.width, v.y * (float)Screen.height, v.z);
+    }
+
+    public Vector3 ScreenToViewportPoint(Vector3 p) { return new Vector3(p.x / (float)Screen.width, p.y / (float)Screen.height, p.z); }
+
+    public Vector3 ViewportToScreenPoint(Vector3 v) { return new Vector3(v.x * (float)Screen.width, v.y * (float)Screen.height, v.z); }
+
+#if UNITY_MANAGED
+    /// <summary>The part of the window the camera draws to, 0..1.</summary>
+    public Rect rect = new Rect(0f, 0f, 1f, 1f);
+
+    public void Render() { }
+#endif
 }
 
 /// <summary>The scene's objects and the frame loop.</summary>
