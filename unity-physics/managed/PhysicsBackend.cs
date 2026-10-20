@@ -29,7 +29,7 @@ public static class PhysicsBackend
         for (int i = 0; i < Physics2D.bodies.Count; i++)
         {
             Rigidbody2D r = Physics2D.bodies[i];
-            if (r.destroyed || !r.gameObject.activeSelf) continue;
+            if (r.destroyed || !r.gameObject.activeInHierarchy || !r.simulated) continue;
             float vx = r.velocity.x;
             float vy = r.velocity.y;
             float fx;
@@ -68,7 +68,7 @@ public static class PhysicsBackend
                     bool aMoves = a.body != null && a.body.bodyType != RigidbodyType2D.Static;
                     bool bMoves = b.body != null && b.body.bodyType != RigidbodyType2D.Static;
                     if (!aMoves && !bMoves) continue;               // two static Physics2D.colliders never meet
-                    if (!Test(a, b)) continue;
+                    if (!Physics2D.Collides(a, b) || !Test(a, b)) continue;
                     bool trigger = a.isTrigger || b.isTrigger;
                     if (iter == 0)
                     {

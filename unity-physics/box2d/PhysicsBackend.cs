@@ -118,7 +118,7 @@ public static class PhysicsBackend
     static void SyncJoint(Joint2D j)
     {
         Rigidbody2D own = j.gameObject.GetComponent<Rigidbody2D>();
-        bool live = j.enabled && !j.destroyed && j.gameObject.activeSelf && own != null && own.handle >= 0 && !own.disabled;
+        bool live = j.enabled && !j.destroyed && j.gameObject.activeInHierarchy && own != null && own.handle >= 0 && !own.disabled;
         int other = -1;
         if (j.connectedBody != null)
         {
@@ -177,7 +177,7 @@ public static class PhysicsBackend
 
     static void SyncBody(Rigidbody2D r)
     {
-        bool live = !r.destroyed && r.gameObject.activeSelf;
+        bool live = !r.destroyed && r.gameObject.activeInHierarchy && r.simulated;
         if (r.handle < 0)
         {
             if (!live) return;
@@ -239,7 +239,11 @@ public static class PhysicsBackend
         float v = c.sizeX * 3.1f + c.sizeY * 5.3f + c.radius * 7.7f + c.offset.x * 11.1f + c.offset.y * 13.3f;
         v = v + c.bounciness * 17.1f + c.friction * 19.9f + sx * 29.3f + sy * 31.7f;
         if (c.isTrigger) v = v + 23.5f;
-        v = v + c.kind * 37.9f + c.frictionCombine * 41.3f + c.bounceCombine * 43.7f;
+        v = v + c.kind * 37.9f + c.frictionCombine * 41.3f + c.bounceCombine * 43.7f + c.version * 61.7f;
+        EdgeCollider2D ec = c as EdgeCollider2D;
+        if (ec != null) v = v + ec.pts.Count * 47.1f + ec.edgeRadius * 67.3f;
+        BoxCollider2D bc = c as BoxCollider2D;
+        if (bc != null) v = v + bc.edgeRadius * 67.3f;
         PolygonCollider2D pc = c as PolygonCollider2D;
         if (pc != null) v = v + pc.pts.Count * 47.1f + pc.sizeX * 53.3f + pc.sizeY * 59.9f;
         return v;
@@ -293,7 +297,19 @@ public static class PhysicsBackend
         c.shape = 0;
         if (c.kind == 0)
         {
-            PB2.Box(body, c.uid, 0.5f * c.sizeX * sx, 0.5f * c.sizeY * sy, ox, oy, trig, c.friction, c.bounciness, mat);
+            float er = (c as BoxCollider2D).edgeRadius * MathF.Max(sx, sy);
+            PB2.Box(body, c.uid, 0.5f * c.sizeX * sx + er, 0.5f * c.sizeY * sy + er, ox, oy, trig, c.friction, c.bounciness, mat);
+        }
+        else if (c.kind == 4)
+        {
+            // an edge chain: each segment a capsule as thick as edgeRadius (Box2D refuses a zero radius)
+            EdgeCollider2D ec = c as EdgeCollider2D;
+            float rad = MathF.Max(ec.edgeRadius * MathF.Max(sx, sy), 0.005f);
+            for (int k = 0; k + 3 < ec.pts.Count; k += 2)
+            {
+                PB2.Capsule(body, c.uid, rad, ec.pts[k] * s.x + ox, ec.pts[k + 1] * s.y + oy, ec.pts[k + 2] * s.x + ox, ec.pts[k + 3] * s.y + oy,
+                            trig, c.friction, c.bounciness, mat);
+            }
         }
         else if (c.kind == 1)
         {
