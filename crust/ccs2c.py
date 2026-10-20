@@ -158,13 +158,13 @@ def dna_home():
 
 
 def dna_available():
-    """(True, "") when --dna can work here, else (False, why): DotNetAnywhere beside this repo, and mono-mcs to build its corlib."""
+    """(True, "") when --dna can work here, else (False, why): DotNetAnywhere beside this repo, and mono-mcs or the .NET SDK's csc to build its corlib."""
     try:
         dna_home()
     except Refused as e:
         return False, str(e).splitlines()[0]
-    if not shutil.which("mcs"):
-        return False, "mcs is not installed (apt install mono-mcs), and DotNetAnywhere's corlib is built with it"
+    if not (shutil.which("mcs") or shutil.which("dotnet")):
+        return False, "neither mcs (apt install mono-mcs) nor dotnet is installed, and DotNetAnywhere's corlib is built with one of them"
     return True, ""
 
 
@@ -187,12 +187,12 @@ def dna_prepare(wasm=False):
     if (home, wasm) not in _dna_ready:
         dna_run((["--wasm"] if wasm else []) + ["--lib-only"], home, bdir)
         if not os.path.exists(os.path.join(bdir, "corlib.dll")):
-            raise Refused("DotNetAnywhere's corlib.dll was not built (it needs mcs: apt install mono-mcs)")
+            raise Refused("DotNetAnywhere's corlib.dll was not built (it needs mcs, apt install mono-mcs, or a .NET SDK)")
         _dna_ready[(home, wasm)] = True
     return home, bdir
 
 
-def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False, wasm=False):
+def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False, wasm=False, physics="managed"):
     """The hybrid executable: the lowered C, the glue that calls DotNetAnywhere, and the runtime (with the native functions that managed code
     may [DllImport] in its FFI table).  The managed assembly and corlib.dll go beside it.  With wasm: a WebAssembly module and its launcher
     (see wasm_paths); the managed assembly and corlib.dll go beside them."""
@@ -200,7 +200,7 @@ def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False, wasm=False):
     glue = os.path.join(cpp_dir, name + ".bridge.c")
     manifest = os.path.join(cpp_dir, name + ".ffi.json")
     if not os.path.exists(glue):                                  # nothing in this program is managed
-        return build_exe(c_text, exe, cc=cc, debug=debug, wasm=wasm)
+        return build_exe(c_text, exe, cc=cc, debug=debug, wasm=wasm, physics=physics)
     if os.path.exists(manifest):
         dna_run((["--wasm"] if wasm else []) + ["--ffi", manifest, "--lib-only", "--no-corlib"], home, bdir)
         lib = os.path.join(bdir, "libdna_ffi_wasm.a" if wasm else "libdna_ffi.a")
@@ -215,7 +215,7 @@ def dna_link(c_text, cpp_dir, name, exe, cc=None, debug=False, wasm=False):
     if wasm:
         cmd = [wasm_compiler(cc)] + _cflags(debug) + _wasm_cflags() + ["-I", os.path.join(home, "native", "src"), "-o", out, cfile, glue, lib, "-lm"] + _WASM_LDFLAGS
     else:
-        cmd = [c_compiler(cc)] + _cflags(debug) + ["-I", os.path.join(home, "native", "src"), "-o", exe, cfile, glue, lib, "-lm", "-lpthread"]
+        cmd = [c_compiler(cc)] + _cflags(debug) + ["-I", os.path.join(home, "native", "src"), "-o", exe, cfile, glue, lib] + physics_link(physics) + ["-lm", "-lpthread"]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if p.returncode != 0:
         raise Refused("C compiler failed:\n" + re.sub(r"\x1b\[[0-9;]*m", "", p.stdout.decode("utf-8", "replace")).strip()[-800:])
@@ -262,6 +262,37 @@ def build_run_wasm(c_text, cpp_dir, name="Program", args=(), timeout=120, cc=Non
 
 UNITY_DIR = os.path.join(REPO, "unity")
 UNITY_ENGINE_DIR = os.path.join(REPO, "unity-engine")
+UNITY_ENGINE_MANAGED_DIR = os.path.join(REPO, "unity-engine-managed")
+
+
+def named_files(program, library):
+    """The library files whose types the program names, and the library files those name, in the library's order.  A program that uses none of
+    unity-engine-managed stays all native (it needs no DotNetAnywhere to link)."""
+    def words(path):
+        with open(path, encoding="utf-8-sig") as f:
+            return set(re.findall(r"[A-Za-z_]\w*", f.read()))
+    defines = {}
+    for f in library:
+        with open(f, encoding="utf-8-sig") as fh:
+            text = fh.read()
+            # `// named-by: StartCoroutine ..`: words that need the file although they name none of its types (a member the engine has under UNITY_MANAGED)
+            for line in re.findall(r"//\s*named-by:(.*)", text):
+                for n in line.split():
+                    defines.setdefault(n, set()).add(f)
+            for n in re.findall(r"(?<!\w)(?:class|struct|interface|enum)\s+(\w+)", text):
+                defines.setdefault(n, set()).add(f)
+                if n.endswith("Attribute"):                     # `[Header("..")]` names HeaderAttribute
+                    defines.setdefault(n[:-len("Attribute")], set()).add(f)
+    # ponytail: a type is "named" when its identifier appears anywhere in a file (a member called `Random` pulls Random.cs in); the
+    # upgrade path is Roslyn's own answer, from a first --describe pass.
+    used, todo = set(), list(program)
+    while todo:
+        for w in words(todo.pop()):
+            for f in defines.get(w, ()):
+                if f not in used:
+                    used.add(f)
+                    todo.append(f)
+    return [f for f in library if f in used]
 
 
 def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), wasm=False, unity_types=False, unity_engine=False, describe=None, physics="managed"):
@@ -269,14 +300,22 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
     Raises Refused with the diagnostics."""
     if isinstance(inputs, str):
         inputs = [inputs]
+    managed_engine = []
     try:
         files = inputs_mod.expand(inputs)
+        program = list(files)                                   # the program's own (what decides which of unity-engine-managed it needs)
         for b in bindings:                                      # code-free C# that names foreign C: part of the program
             files += [f for f in inputs_mod.expand([b]) if f not in files]
         if unity_types or unity_engine:                                         # the built-in UnityEngine value types (unity/*.cs)
             files += [f for f in inputs_mod.expand([UNITY_DIR]) if f not in files]
         if unity_engine:                                        # the engine (unity-engine/*.cs): GameObject, Transform, MonoBehaviour ...
             files += [f for f in inputs_mod.expand([UNITY_ENGINE_DIR]) if f not in files]
+            if dna:                                             # the rest of UnityEngine, in full C#: what Crust cannot lower runs on DotNetAnywhere
+                library = [f for f in inputs_mod.expand([UNITY_ENGINE_MANAGED_DIR]) if f not in files]
+                managed_engine = named_files(program, library)
+                if managed_engine:                              # then UNITY_MANAGED is defined, and the engine's `#if UNITY_MANAGED` code names some of it too
+                    managed_engine = named_files(program + inputs_mod.expand([UNITY_ENGINE_DIR]), library)
+                files += managed_engine
             files += [f for f in inputs_mod.expand([os.path.join(REPO, "unity-physics", physics)]) if f not in files]      # the 2D physics backend
     except inputs_mod.InputError as e:
         raise Refused(str(e))
@@ -286,6 +325,8 @@ def to_cpp(inputs, main=None, workdir=None, name=None, dna=False, bindings=(), w
     with open(listing, "w") as f:
         f.write("\n".join(files) + "\n")
     cmd = compiler_cmd() + [files[0], name, "--crust", "--home=" + REPO, "--srclist=" + listing]
+    if managed_engine:
+        cmd.append("--define=UNITY_MANAGED")        # the engine's members that need the managed half (`#if UNITY_MANAGED` in unity-engine/*.cs)
     if main:
         cmd.append("--main=" + main)
     if describe:
@@ -522,7 +563,7 @@ def main(argv):
                 print("wrote " + f)
         def build(exe):
             if o["dna"]:
-                dna_link(c, cpp_dir, name, exe, cc=o["cc"], debug=o["debug"], wasm=o["wasm"])
+                dna_link(c, cpp_dir, name, exe, cc=o["cc"], debug=o["debug"], wasm=o["wasm"], physics=o["physics"])
             else:
                 build_exe(c, exe, shivyc=o["shivyc"], cc=o["cc"], debug=o["debug"], physics=o["physics"])
         if o["exe"]:

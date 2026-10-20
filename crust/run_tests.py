@@ -36,7 +36,7 @@ TESTS = os.path.join(HERE, "tests")
 WASM = os.environ.get("CCS_WASM") == "1"                  # --wasm: build and run every case as WebAssembly
 
 
-def dotnet_reference(files, main=None):
+def dotnet_reference(files, main=None, defines=()):
     """Run the case (the list of .cs files) on real .NET.  None if there is no SDK."""
     dotnet = shutil.which("dotnet")
     if not dotnet:
@@ -55,7 +55,8 @@ def dotnet_reference(files, main=None):
                 ("System.Private.CoreLib.dll", "System.Runtime.dll", "System.Console.dll", "System.Collections.dll")]
         exe = os.path.join(tmp, "ref.dll")
         p = subprocess.run([dotnet, csc, "-nologo", "-nowarn:0626,0219,0168,0414,0649,0169", "-unsafe", "-out:" + exe,
-                            "-t:exe", "-noconfig", "-nostdlib"] + (["-main:" + main] if main else []) + refs + sorted(files),
+                            "-t:exe", "-noconfig", "-nostdlib"] + ["-define:" + d for d in defines]
+                           + (["-main:" + main] if main else []) + refs + sorted(files),
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if p.returncode != 0:
             return ("compile-error", p.stdout.decode("utf-8", "replace"))
@@ -187,8 +188,17 @@ def run_case(name, path):
             except Exception as e:
                 return (meta["refuse"] in str(e), "cpprust refused: " + str(e)[:150])
             return (False, "expected a refusal containing %r, got a translation" % meta["refuse"])
+        engine = (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity-engine", "*.cs")))
+                  + sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity-physics", "managed", "*.cs")))   # (ccs2c's default backend)
+                  if "unity-engine" in meta else [])
+        # with --dna, the managed half of the engine the case uses, as ccs2c picks it (and UNITY_MANAGED, which it then defines)
+        managed = []
+        if engine and "dna" in meta:
+            library = ccs2c.inputs_mod.expand([ccs2c.UNITY_ENGINE_MANAGED_DIR])
+            if ccs2c.named_files(files, library):
+                managed = ccs2c.named_files(files + engine, library)
         ref = dotnet_reference(files + (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity", "*.cs"))) if ("unity-types" in meta or "unity-engine" in meta) else [])
-                                + (sorted(glob.glob(os.path.join(os.path.dirname(HERE), "unity-engine", "*.cs"))) if "unity-engine" in meta else []), meta.get("main"))
+                                + engine + managed, meta.get("main"), ["UNITY_MANAGED"] if managed else [])
         try:
             dna = "dna" in meta
             cpp, d = ccs2c.to_cpp(inp, meta.get("main"), dna=dna, wasm=WASM, unity_types="unity-types" in meta, unity_engine="unity-engine" in meta)
