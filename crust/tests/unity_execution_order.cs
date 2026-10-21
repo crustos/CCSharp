@@ -1,3 +1,4 @@
+// oracle: dotnet
 // unity-engine
 // Script Execution Order: scripts run Awake, Start and Update lowest order first (attach order within one order), and a script attached during an
 // Update, ahead of the one running, does not make any script update twice in that frame.
