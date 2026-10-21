@@ -335,11 +335,26 @@ def _write_program(d, source, name):
     return cs, work
 
 
+def _header_options(source):
+    """The build options a case asks for in its leading `//` lines, as crust/run_tests.py reads them: `// unity-types`, `// unity-engine`."""
+    opts = {}
+    for line in source.splitlines():
+        if re.match(r"//\s*unity-types\s*$", line):
+            opts["unity_types"] = True
+        elif re.match(r"//\s*unity-engine\s*$", line):
+            opts["unity_engine"] = True
+        elif re.match(r"//\s*oracle:\s*dotnet\s*$", line):
+            opts["oracle_dotnet"] = True
+        elif line.strip() and not line.startswith("//"):
+            break
+    return opts
+
+
 def reference_cpp(source, name="P"):
     """The C++ subset CC# writes for `source`: (cpp text, directory of generated files, scratch directory to remove)."""
     d = tempfile.mkdtemp(prefix="ccs-direct-")
     cs, work = _write_program(d, source, name)
-    cpp, cpp_dir = ccs2c.to_cpp([cs], name=name, workdir=work)
+    cpp, cpp_dir = ccs2c.to_cpp([cs], name=name, workdir=work, **{k: v for k, v in _header_options(source).items() if k != "oracle_dotnet"})
     return cpp, cpp_dir, d
 
 
@@ -411,8 +426,10 @@ def vector_pieces(skel_c):
     """The skeleton instantiates std::vector<Name> (and std::vector<Name *>, for an arena class) for each program class a vector holds,
     against a stand-in class CcsE_Name, because the instance's text is cpprust's.  Take those instances out of the skeleton's C:
     (the C without the stand-ins and their instances, {key: (fwd, proto, defs, struct)}), the key being Name, or Name_P for the pointer
-    instance (whose struct line cpprust writes before the class, apart from its functions).  The program's sections place them (see the
-    markers in CppLower.cs)."""
+    instance.  `struct` is the instance's struct line, which cpprust writes next to the class's struct (right after it; for the pointer
+    instance, right before it), and `defs` its functions, which it writes next to the class's functions (after them).  The program's
+    sections place them (see the markers in CppLower.cs).  The stand-in's struct line and the `;` that ends its class go too: the
+    program's own classes bring theirs."""
     c = skel_c
     pieces = {}
     for n in re.findall(r"^struct CcsE_(\w+);$", c, re.M):
@@ -422,7 +439,7 @@ def vector_pieces(skel_c):
             raise RuntimeError("the skeleton's C has no forward declaration of the stand-in of " + n)
         c = c.replace(stub, "", 1)
         c = re.sub(r"^static [^\n]*(?<![\w])%s_\w+\([^\n]*\);\n" % x, "", c, flags=re.M)
-        last_end = 0
+        c = re.sub(r"^static [^\n]*(?<![\w])%s_\w+\([^\n]*\) \{[^\n]*\}\n" % x, "", c, flags=re.M)
         found = False
         for suffix in ("", "_P"):
             v = "vector_" + x + suffix
@@ -431,30 +448,31 @@ def vector_pieces(skel_c):
                 continue
             found = True
             c = c.replace(fwd, "", 1)
-            vproto = re.compile(r"^static [^\n]*\b%s_\w+\([^\n]*\);\n" % v, re.M)
+            own = r"(?!P_)" if suffix == "" else ""             # (vector_X_P's functions also start with `vector_X_`)
+            vproto = re.compile(r"^static [^\n]*\b%s_%s\w+\([^\n]*\);\n" % (v, own), re.M)
             proto = "".join(m.group(0) for m in vproto.finditer(c))
             c = vproto.sub("", c)
-            m = re.search(r"static inline [^\n]*%s_rend\([^\n]*\) \{[^\n]*\}\n" % v, c)
-            start = c.index("struct %s {" % v)
-            defs = c[start:m.end()]
-            struct = ""
-            if suffix == "_P":                                  # the struct line is written ahead of the class; the functions follow it
-                struct, defs = defs.split("\n", 1)
-                struct += "\n"
-                c = c.replace(struct, "", 1)
-            else:
-                last_end = max(last_end, m.end())
-            key = n + suffix
-            pieces[key] = tuple(t.replace(x, n) for t in (fwd, proto, defs, struct))
-            if suffix == "_P":
-                # the functions of the pointer instance sit after the class, inside the region removed below
-                m2 = re.search(r"static inline [^\n]*%s_rend\([^\n]*\) \{[^\n]*\}\n" % v, c)
-                last_end = max(last_end, m2.end())
+            sm = re.search(r"^struct %s \{[^\n]*\};\n" % v, c, re.M)
+            if not sm:
+                raise RuntimeError("the skeleton's C has no struct line for " + v)
+            struct = sm.group(0)
+            c = c[:sm.start()] + c[sm.end():]
+            first = re.search(r"^static inline [^\n]*\b%s_new\([^\n]*\)[ \t]*\{" % v, c, re.M)
+            last = re.search(r"static inline [^\n]*%s_rend\([^\n]*\) \{[^\n]*\}\n" % v, c)
+            if not first or not last:
+                raise RuntimeError("the skeleton's C has no functions for " + v)
+            defs = c[first.start():last.end()]
+            c = c[:first.start()] + c[last.end():]
+            pieces[n + suffix] = tuple(t.replace(x, n) for t in (fwd, proto, defs, struct))
         if not found:
             raise RuntimeError("the skeleton's C has no vector instance for the stand-in of " + n)
-        i = c.index("struct %s {" % x)
-        j = c.index("\n;\n", max(last_end, i)) + 3
-        c = c[:i] + c[j:]
+        sm = re.search(r"^struct %s \{[^\n]*\};\n" % x, c, re.M)
+        if not sm:
+            raise RuntimeError("the skeleton's C has no struct line for the stand-in of " + n)
+        semi = re.compile(r"\n*^;\n", re.M).search(c, sm.end())                # the `;` of the stand-in's class: the next one
+        if not semi or c[sm.end():semi.start()].strip():
+            raise RuntimeError("the skeleton's C has no `;` after the stand-in of " + n)
+        c = c[:sm.start()] + c[sm.end():semi.start()] + c[semi.end():]
     return c, pieces
 
 
@@ -464,35 +482,55 @@ def splice(skel_c, sec):
     sec = dict(sec)
     for k, idx, tag in (("fwd", 0, "FWD"), ("proto", 1, "PROTO"), ("defs", 2, "DEFS")):
         sec[k] = re.sub(r"/\*CCS-VEC-%s:(\w+)\*/\n" % tag, lambda m: vecs[m.group(1)][idx], sec[k])
-    sec["defs"] = re.sub(r"/\*CCS-VEC-STRUCT:(\w+)\*/\n", lambda m: vecs[m.group(1)][3], sec["defs"])
+    sec["structs"] = re.sub(r"/\*CCS-VEC-STRUCT:(\w+)\*/\n", lambda m: vecs[m.group(1)][3], sec["structs"])
     fwd = "struct %s;\ntypedef struct %s %s;\n" % (SLOT, SLOT, SLOT)
     if fwd not in skel_c:
         raise RuntimeError("the skeleton's C has no forward declaration of %s" % SLOT)
     c = skel_c.replace(fwd, sec["fwd"], 1)
+    if sec.get("enums"):                              # cpprust lifts every enum to the head of the file: the library's first, then the program's, ahead of the forward declarations
+        first_fwd = re.search(r"^struct \w+;\n", c, re.M)
+        if not first_fwd:
+            raise RuntimeError("the skeleton's C has no forward declaration to put the enums before")
+        c = c[:first_fwd.start()] + sec["enums"] + c[first_fwd.start():]
     protos = list(re.finditer(r"^static [^\n]*\b%s_\w+\([^\n]*\);\n" % SLOT, c, re.M))      # Main, and the probe the lowerer adds for `bool`
     if not protos:
         raise RuntimeError("the skeleton's C has no prototype of %s_Main" % SLOT)
     for m in reversed(protos[1:]):
         c = c[:m.start()] + c[m.end():]
     c = c[:protos[0].start()] + sec["proto"] + c[protos[0].end():]
-    i = c.index("struct %s {" % SLOT)                 # the slot's definition, and main after it...
-    j = c.index("int main(int argc, char **argv) {", i)
+    # cpprust writes, in this order: every class's struct, the bodies of the library instances the unit uses, every class's functions, the
+    # last class's `;`, main, and coost's out-of-line bodies.  The skeleton has the slot's struct where the program's structs go, and the
+    # slot's functions (through the end of main) where the program's functions go: only those two places are replaced, so the library
+    # instances' bodies between them stay.
+    slot_struct = re.search(r"^struct %s \{[^\n]*\};\n" % SLOT, c, re.M)
+    if not slot_struct:
+        raise RuntimeError("the skeleton's C has no definition of the struct %s" % SLOT)
+    i = slot_struct.start()
+    between_from = slot_struct.end()
+    slot_fn = re.compile(r"^static [^\n]*\b%s_\w+\([^\n]*\)[ \t]*\{" % SLOT, re.M).search(c, between_from)   # the first function the slot defines
+    if not slot_fn:
+        raise RuntimeError("the skeleton's C has no function of %s" % SLOT)
+    j = c.index("int main(int argc, char **argv) {", slot_fn.start())
     k = c.index("{", j)
     depth = 0
-    for e in range(k, len(c)):                        # ...to the closing brace of main; what cpprust wrote after it (coost's out-of-line bodies) stays
+    for e in range(k, len(c)):                        # the closing brace of main; what cpprust wrote after it (coost's out-of-line bodies) stays
         depth += (c[e] == "{") - (c[e] == "}")
         if depth == 0:
             break
     tail = c[e + 1:]
-    shift = len(set(re.findall(r"__CCS_RET(\d+)__", sec["defs"])))      # the program's returns come before the tail's in cpprust's numbering
+    shift = len(set(re.findall(r"__CCS_RET(\d+)__", sec["structs"] + sec["defs"])))      # the program's returns come before the tail's in cpprust's numbering
     tail = re.sub(r"\b_cpp_ret(\d+)\b", lambda m: "_cpp_ret%d" % (int(m.group(1)) + shift), tail)
     head = c[:i]
+    between = c[between_from:slot_fn.start()]         # the library instances' bodies
     # cpprust numbers its return temporaries across the unit: the program's come after everything lowered before it
-    base = max([int(n) for n in re.findall(r"\b_cpp_ret(\d+)\b", head)] or [0])
-    defs = re.sub(r"__CCS_RET(\d+)__", lambda m: "_cpp_ret%d" % (base + int(m.group(1))), sec["defs"])
+    base = max([int(n) for n in re.findall(r"\b_cpp_ret(\d+)\b", head + between)] or [0])
+    def numbered(text):
+        return re.sub(r"__CCS_RET(\d+)__", lambda m: "_cpp_ret%d" % (base + int(m.group(1))), text)
+    defs = numbered(sec["defs"])
+    structs = numbered(sec["structs"])
     heap = "/*CCS-HEAP*/\n" in defs
     defs = defs.replace("/*CCS-HEAP*/\n", "")
-    out = head + defs + tail
+    out = head + structs + between + defs + tail
     if heap:
         out = "void *malloc(unsigned long);\nvoid free(void *);\n" + out
     return out
@@ -510,7 +548,40 @@ def direct_c(source, name="P"):
         sec = lower_cpp(cpp_dir, name, foreign=foreign)                               # phase 2: the program, knowing what the library types are
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    return splice(skel, sec)
+    got = _Direct(splice(skel, sec))
+    got.behavioral = "behavioral" in sec
+    return got
+
+
+def expected_run(source, name="P"):
+    """What the program does: (exit status, stdout), by cpprust's C when that builds, else by .NET itself (cpprust cannot build every program:
+    a static member template called as `Cls::M<T>()` is one it leaves as C++)."""
+    try:
+        if _header_options(source).get("oracle_dotnet"):
+            raise ccs2c.Refused("oracle is .NET for this case")
+        return ccs2c.build_run(reference_c(source, name))
+    except ccs2c.Refused:
+        import glob, run_tests
+        d = tempfile.mkdtemp(prefix="ccs-dotnet-")
+        try:
+            with open(os.path.join(d, "Case.cs"), "w") as f:
+                f.write(source)
+            files = run_tests.inputs_mod.expand([d])
+            root = os.path.dirname(run_tests.HERE)
+            opts = _header_options(source)
+            extra = []
+            if opts.get("unity_types") or opts.get("unity_engine"):
+                extra += sorted(glob.glob(os.path.join(root, "unity", "*.cs")))
+            if opts.get("unity_engine"):
+                extra += sorted(glob.glob(os.path.join(root, "unity-engine", "*.cs"))) + sorted(glob.glob(os.path.join(root, "unity-physics", "managed", "*.cs")))
+            return run_tests.dotnet_reference(files + extra, None, [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class _Direct(str):
+    """The direct C, and whether it is meant to behave like cpprust's rather than to be the same text (inheritance)."""
+    behavioral = False
 
 
 # ---------------------------------------------------------------------------------------------------- the reference
@@ -600,7 +671,10 @@ class Direct(unittest.TestCase):
         except NotImplementedError as e:
             self.skipTest("pending: %s" % e)
         want = reference_c(source, name)
-        self.assertEqual(normalize_c(got), normalize_c(want))
+        if got.behavioral:
+            self.assertEqual(ccs2c.build_run(got), expected_run(source, name))
+        else:
+            self.assertEqual(normalize_c(got), normalize_c(want))
 
     def runs_like_csharp(self, source, want, name="P"):
         """The direct C compiles with gcc and behaves as the C# does: (exit status, stdout)."""
@@ -663,8 +737,11 @@ def _add_corpus_tests():
                 got = direct_c(source)
             except NotImplementedError as e:
                 self.skipTest("pending: %s" % e)
-            self.assertEqual(normalize_c(got), normalize_c(reference_c(source)))
-        case.__doc__ = "crust/tests/%s.cs: the direct C is the same as cpprust's" % cname
+            if got.behavioral:                                   # inheritance: its own vtables; what matters is that it does what cpprust's (or .NET's) does
+                self.assertEqual(ccs2c.build_run(got), expected_run(source))
+            else:
+                self.assertEqual(normalize_c(got), normalize_c(reference_c(source)))
+        case.__doc__ = "crust/tests/%s.cs: the direct C is the same as cpprust's (behaves the same, for inheritance)" % cname
         setattr(Corpus, "test_corpus_%s" % cname, case)
 
 
