@@ -220,6 +220,8 @@ def run_case(name, path):
             return (False, str(e)[-600:])
         except Exception as e:
             return (False, "cpprust: " + str(e)[:600])
+        if "expect-rc" in meta and (rc & 0xFF) != int(meta["expect-rc"]):    # a self-checking test: agreeing with .NET is not enough
+            return (False, "rc=%d, expected %s; out=%r" % (rc & 0xFF, meta["expect-rc"], out[:300]))
         if ref is None:
             exp = int(meta.get("expect-rc", "0"))
             return (rc == exp, "no .NET reference; rc=%d%s" % (rc, note))
