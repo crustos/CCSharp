@@ -158,8 +158,10 @@ public abstract class Collider2D : Component
     public float staticX;               // where the static body was put
     public float staticY;
     public int version;                 // counts changes to a polygon's or an edge's points (the backend makes the shape again)
+    public int pairHead;                // its first pair in the list Physics2D last indexed for Held, valid while pairStamp is that index's
+    public int pairStamp;
 
-    public override void OnAttach() { enabled = true; shape = -1; staticBody = -1; uid = Physics2D.NextUid(); Physics2D.colliders.Add(this); }
+    public override void OnAttach() { enabled = true; shape = -1; staticBody = -1; Physics2D.AddCollider(this); }
 
 #if UNITY_MANAGED
     PhysicsMaterial2D m_Material;
@@ -523,6 +525,16 @@ public static class Physics2D
     public static List<int> layerMasks = new List<int>();
     static int uids;
     public static int NextUid() { uids += 1; return uids; }
+    // every collider by uid - 1 (null once removed): uids are handed out in order
+    // ponytail: one slot per collider ever attached, never reused; upgrade path: a free list if a game churns through colliders
+    static List<Collider2D> byUid = new List<Collider2D>();
+
+    public static void AddCollider(Collider2D c)
+    {
+        c.uid = NextUid();
+        colliders.Add(c);
+        byUid.Add(c);
+    }
     /// <summary>An object's z rotation in degrees, from its quaternion.</summary>
     public static float AngleOf(Transform t)
     {
@@ -662,11 +674,7 @@ public static class Physics2D
 
     public static Collider2D ByUid(int uid)
     {
-        for (int i = 0; i < colliders.Count; i++)
-        {
-            if (colliders[i].uid == uid) return colliders[i];
-        }
-        return null;
+        return uid >= 1 && uid <= byUid.Count ? byUid[uid - 1] : null;
     }
 
     static Collision2D scratch;
@@ -706,6 +714,7 @@ public static class Physics2D
         {
             if (colliders[i] == c) { colliders.RemoveAt(i); break; }
         }
+        if (c.uid >= 1 && c.uid <= byUid.Count) byUid[c.uid - 1] = null;
         PhysicsBackend.ReleaseCollider(c);
         // a pair that held it is over without a message (the object is going away)
         for (int i = prevA.Count - 1; i >= 0; i--)
@@ -763,11 +772,30 @@ public static class Physics2D
 
     // ---- messages
 
-    static bool Held(List<Collider2D> la, List<Collider2D> lb, List<int> lt, Collider2D a, Collider2D b)
+    // Held's index of one pair list: each collider's first pair in it (Collider2D.pairHead) and each pair's next one of the same collider
+    static List<int> pairNext = new List<int>();
+    static int pairStamp;
+
+    static void Index(List<Collider2D> la)
     {
+        pairStamp += 1;
+        pairNext.Clear();
         for (int i = 0; i < la.Count; i++)
         {
-            if (la[i] == a && lb[i] == b) return true;
+            Collider2D a = la[i];
+            if (a.pairStamp != pairStamp) { a.pairStamp = pairStamp; a.pairHead = -1; }
+            pairNext.Add(a.pairHead);
+            a.pairHead = i;
+        }
+    }
+
+    /// <summary>Whether (a, b) is a pair of the list Index was last given (lb its second colliders): only a's own pairs are looked at.</summary>
+    static bool Held(List<Collider2D> lb, Collider2D a, Collider2D b)
+    {
+        if (a.pairStamp != pairStamp) return false;
+        for (int i = a.pairHead; i >= 0 && i < lb.Count; i = pairNext[i])
+        {
+            if (lb[i] == b) return true;
         }
         return false;
     }
@@ -781,14 +809,16 @@ public static class Physics2D
             // still does (pb2 has no contact filter).  Upgrade path: a b2ShapeDef filter category / mask per collider and a custom filter.
             if (!Collides(curA[i], curB[i])) { curA.RemoveAt(i); curB.RemoveAt(i); curT.RemoveAt(i); }
         }
+        Index(prevA);
         for (int i = 0; i < curA.Count; i++)
         {
-            bool known = Held(prevA, prevB, prevT, curA[i], curB[i]);
+            bool known = Held(prevB, curA[i], curB[i]);
             Send(curA[i], curB[i], curT[i] == 1, known ? 1 : 0);
         }
+        Index(curA);
         for (int i = 0; i < prevA.Count; i++)
         {
-            if (!Held(curA, curB, curT, prevA[i], prevB[i])) Send(prevA[i], prevB[i], prevT[i] == 1, 2);
+            if (!Held(curB, prevA[i], prevB[i])) Send(prevA[i], prevB[i], prevT[i] == 1, 2);
         }
         // this step's pairs are the next step's "last"
         prevA.Clear();
